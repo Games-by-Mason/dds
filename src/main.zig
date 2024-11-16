@@ -4,6 +4,7 @@ const assert = std.debug.assert;
 const Dds = @import("Dds");
 const structopt = @import("structopt");
 const Command = structopt.Command;
+const NamedArg = structopt.NamedArg;
 const PositionalArg = structopt.PositionalArg;
 const log = std.log;
 
@@ -16,7 +17,14 @@ const max_file_len = 4294967296;
 
 const command: Command = .{
     .name = "dds",
-    .description = "Converts PNGs to uncompressed DDS files.",
+    .description = "Converts PNG to DDS.",
+    .named_args = &.{
+        NamedArg.init(bool, .{
+            .long = "alpha",
+            .short = 'a',
+            .default = .{ .value = false },
+        }),
+    },
     .positional_args = &.{
         PositionalArg.init([]const u8, .{
             .meta = "INPUT",
@@ -56,18 +64,20 @@ pub fn main() !void {
     var uncompressed_ptr: [*c]u8 = undefined;
     var width: c_uint = 0;
     var height: c_uint = 0;
-    if (c.lodepng_decode32(
+    if (c.lodepng_decode_memory(
         &uncompressed_ptr,
         &width,
         &height,
         input_bytes.ptr,
         @intCast(input_bytes.len),
+        if (args.alpha) c.LCT_RGBA else c.LCT_RGB,
+        8,
     ) != 0) {
         log.err("{s}: lodepng failed", .{args.INPUT});
         std.process.exit(1);
     }
     defer c.free(uncompressed_ptr);
-    const uncompressed = uncompressed_ptr[0 .. width * height * 4];
+    const uncompressed = if (args.alpha) uncompressed_ptr[0 .. width * height * 4] else uncompressed_ptr[0 .. width * height * 3];
 
     var output = cwd.createFile(args.OUTPUT, .{}) catch |err| {
         log.err("{s}: {s}", .{ args.OUTPUT, @errorName(err) });
@@ -91,10 +101,10 @@ pub fn main() !void {
         .width = width,
         .ddspf = .{
             .flags = .{
-                .alphapixels = true,
+                .alphapixels = args.alpha,
                 .rgb = true,
             },
-            .rgb_bit_count = 32,
+            .rgb_bit_count = if (args.alpha) 32 else 24,
             .r_bit_mask = 0x00ff0000,
             .g_bit_mask = 0x0000ff00,
             .b_bit_mask = 0x000000ff,
