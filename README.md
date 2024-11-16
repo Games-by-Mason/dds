@@ -10,4 +10,5 @@ A **work in progress** DDS utility for Zig.
 * [ ] Look into srgb/alpha premul conversions
 * [ ] Support applying lossless compression to the resulting DDS
 * [ ] Support automatic mipmap generation
+* [ ] Check length of data when decoding
 * [ ] Look into why lodepng fails UBSAN

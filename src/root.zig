@@ -76,13 +76,13 @@ pub const Header = extern struct {
     pitch_or_linear_size: u32 = 0,
     depth: u32 = 0,
     mip_map_count: u32 = 0,
-    _reserved1: [11]u32 = .{0} ** 11,
+    reserved1: [11]u32 = .{0} ** 11,
     ddspf: PixelFormat,
     caps: Caps = .{},
     caps2: Caps2 = .{},
     _caps3: u32 = 0,
     _caps4: u32 = 0,
-    _reserved2: u32 = 0,
+    reserved2: u32 = 0,
 };
 
 pub const Dxt10 = extern struct {
@@ -206,9 +206,10 @@ pub const Dxt10 = extern struct {
         p208 = 130,
         v208 = 131,
         v408 = 132,
-        sampler_feedback_min_mip_opaque,
-        sampler_feedback_mip_region_used_opaque,
+        sampler_feedback_min_mip_opaque = 133,
+        sampler_feedback_mip_region_used_opaque = 134,
         force_uint = 0xffffffff,
+        _,
     };
 
     pub const ResourceDimension = enum(u32) {
@@ -217,6 +218,7 @@ pub const Dxt10 = extern struct {
         texture1d = 2,
         texture2d = 3,
         texture3d = 4,
+        _,
     };
 
     dxgi_format: DxgiFormat,
@@ -230,24 +232,25 @@ header: *const Header,
 dxt10: ?*const Dxt10,
 data: []const u8,
 
-pub fn init(bytes: []align(@alignOf(u32)) const u8) @This() {
+pub const Error = error{InvalidDds};
+
+pub fn init(bytes: []align(@alignOf(u32)) const u8) Error!@This() {
     comptime assert(builtin.cpu.arch.endian() == .little);
-    assert(std.mem.eql(u8, bytes[0..four_cc.len], four_cc));
+    if (!std.mem.eql(u8, bytes[0..four_cc.len], four_cc)) {
+        return Error.InvalidDds;
+    }
 
     const header: *const Header = @ptrCast(bytes[four_cc.len..][0..@sizeOf(Header)].ptr);
-    assert(header.size == @sizeOf(Header));
-    assert(header.ddspf.size == @sizeOf(Header.PixelFormat));
+    if (header.size != @sizeOf(Header)) return Error.InvalidDds;
+    if (header.ddspf.size != @sizeOf(Header.PixelFormat)) return error.InvalidDds;
 
-    const is_dx10 = std.meta.eql(header.ddspf.flags, .{ .four_cc = true }) and
-        std.mem.eql(u8, &header.ddspf.four_cc, "DX10");
-    const dxt10: ?*const Dxt10 = if (is_dx10) b: {
-        if (bytes.len < four_cc.len + @sizeOf(Header) + @sizeOf(Dxt10)) {
-            @panic("invalid DDS");
-        }
-        break :b @ptrCast(bytes[four_cc.len + @sizeOf(Header) ..][0 .. four_cc.len + @sizeOf(Dxt10)]);
+    const has_dx10 = header.ddspf.flags.four_cc and std.mem.eql(u8, &header.ddspf.four_cc, "DX10");
+    const dxt10: ?*const Dxt10 = if (has_dx10) b: {
+        if (four_cc.len + @sizeOf(Header) + @sizeOf(Dxt10) > bytes.len) return Error.InvalidDds;
+        break :b @ptrCast(bytes[four_cc.len + @sizeOf(Header) ..][0..@sizeOf(Dxt10)]);
     } else null;
 
-    const offset = four_cc.len + @sizeOf(Header) + if (is_dx10) @sizeOf(Dxt10) else @as(usize, 0);
+    const offset = four_cc.len + @sizeOf(Header) + if (dxt10 == null) 0 else @sizeOf(Dxt10);
     const data = bytes[offset..];
 
     return .{

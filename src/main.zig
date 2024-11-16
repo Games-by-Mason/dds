@@ -141,10 +141,10 @@ pub fn main() !void {
                     .rgb = true,
                 },
                 .rgb_bit_count = if (output_alpha) 32 else 24,
-                .r_bit_mask = 0x00ff0000,
-                .g_bit_mask = 0x0000ff00,
-                .b_bit_mask = 0x000000ff,
                 .a_bit_mask = 0xff000000,
+                .b_bit_mask = 0x00ff0000,
+                .g_bit_mask = 0x0000ff00,
+                .r_bit_mask = 0x000000ff,
             },
         };
         output.writeAll(std.mem.asBytes(&header)) catch |err| {
