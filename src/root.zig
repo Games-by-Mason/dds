@@ -250,7 +250,7 @@ pub fn init(bytes: []align(@alignOf(u32)) const u8) Error!@This() {
         break :b @ptrCast(bytes[four_cc.len + @sizeOf(Header) ..][0..@sizeOf(Dxt10)]);
     } else null;
 
-    const offset = four_cc.len + @sizeOf(Header) + if (dxt10 == null) 0 else @sizeOf(Dxt10);
+    const offset = four_cc.len + @sizeOf(Header) + if (dxt10 == null) @as(usize, 0) else @sizeOf(Dxt10);
     const data = bytes[offset..];
 
     return .{
