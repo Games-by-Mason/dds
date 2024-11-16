@@ -1,0 +1,22 @@
+.{
+    .name = "dds",
+    .version = "0.0.0",
+    .minimum_zig_version = "0.14.0-dev.1820+ea527f7a8",
+    .dependencies = .{
+        .bc7enc_rdo = .{
+            .url = "https://github.com/Games-by-Mason/bc7enc_rdo_zig/archive/f1c0638a2c511b167a752a1ac31d9b49a2a0c1c1.tar.gz",
+            .hash = "1220fb99784b75b4ad7493972988bfcce42418d71e8f52cdf7e23dbe834d38fdc841",
+        },
+        .structopt = .{
+            .url = "https://github.com/Games-by-Mason/structopt/archive/5bc9d351de473812a7b0c65f2f2072341107793f.zip",
+            .hash = "12209b09cadda994667644d5d2b7b0929d6b6086577844f9a07c0a9794bd73d72d63",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}
