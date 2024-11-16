@@ -18,22 +18,24 @@ pub const Header = extern struct {
             luminance: bool = false,
             _padding3: u14 = 0,
         };
-        size: u32,
-        flags: @This().Flags,
-        four_cc: [4]u8,
+
+        size: u32 = @sizeOf(PixelFormat),
+        flags: @This().Flags = .{},
+        four_cc: [4]u8 = .{0} ** 4,
         rgb_bit_count: u32,
         r_bit_mask: u32,
         g_bit_mask: u32,
         b_bit_mask: u32,
         a_bit_mask: u32,
     };
+
     pub const Flags = packed struct(u32) {
-        caps: bool = false,
-        height: bool = false,
-        width: bool = false,
+        caps: bool = true,
+        height: bool = true,
+        width: bool = true,
         pitch: bool = false,
         _padding0: u7 = 0,
-        pixelformat: bool = false,
+        pixelformat: bool = true,
         _padding1: u4 = 0,
         mipmapcount: bool = false,
         _padding2: u1 = 0,
@@ -42,20 +44,45 @@ pub const Header = extern struct {
         depth: bool = false,
         _padding4: u9 = 0,
     };
-    size: u32,
-    flags: Flags,
+
+    pub const Caps = packed struct(u32) {
+        _padding0: u3 = 0,
+        complex: bool = false,
+        _padding1: u8 = 0,
+        texture: bool = true,
+        _padding2: u8 = 0,
+        mipmap: bool = false,
+        _padding3: u10 = 0,
+    };
+
+    pub const Caps2 = packed struct(u32) {
+        _padding0: u8 = 0,
+        cubemap: bool = false,
+        cubemap_positivex: bool = false,
+        cubemap_negativex: bool = false,
+        cubemap_positivey: bool = false,
+        cubemap_negativey: bool = false,
+        cubemap_positivez: bool = false,
+        cubemap_negativez: bool = false,
+        _padding1: u5 = 0,
+        volume: bool = false,
+        _padding2: u11 = 0,
+    };
+
+    size: u32 = @sizeOf(Header),
+    flags: Flags = .{},
     height: u32,
     width: u32,
-    pitch_or_linear_size: u32,
-    depth: u32,
-    mip_map_count: u32,
-    reserved1: [11]u32,
+    pitch_or_linear_size: u32 = 0,
+    depth: u32 = 0,
+    mip_map_count: u32 = 0,
+    _reserved1: [11]u32 = .{0} ** 11,
     ddspf: PixelFormat,
-    caps: u32,
-    caps2: u32,
-    caps3: u32,
-    caps4: u32,
-    reserved2: u32,
+    caps: Caps = .{},
+    caps2: Caps2 = .{},
+    _caps3: u32 = 0,
+    _caps4: u32 = 0,
+    _reserved2: u32 = 0,
 };
 
 pub const Dxt10 = extern struct {
