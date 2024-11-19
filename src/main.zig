@@ -45,6 +45,10 @@ const command: Command = .{
             .long = "alpha-output",
             .default = .{ .value = .premultiplied },
         }),
+        NamedArg.init(?std.compress.flate.deflate.Level, .{
+            .long = "gz",
+            .default = .{ .value = null },
+        }),
     },
     .positional_args = &.{
         PositionalArg.init([]const u8, .{
@@ -74,6 +78,10 @@ const bc7_command: Command = .{
             .long = "uber-level",
             .default = .{ .value = RdoBcParams.bc7enc_max_uber_level },
         }),
+        NamedArg.init(bool, .{
+            .long = "reduce-entropy",
+            .default = .{ .value = false },
+        }),
         NamedArg.init(u8, .{
             .description = "bc7 partitions to scan in mode 1, defaults to highest",
             .long = "max-partitions-to-scan",
@@ -100,9 +108,9 @@ const rdo_command: Command = .{
     .description = "Use RDO to make the output more compressible.",
     .named_args = &.{
         NamedArg.init(f32, .{
-            .description = "bc7 rdo to apply, defaults to 0",
+            .description = "bc7 rdo to apply",
             .long = "lambda",
-            .default = .{ .value = 0.0 },
+            .default = .{ .value = 0.5 },
         }),
         NamedArg.init(?f32, .{
             .description = "bc7 manually set smooth block error scale factor, higher values result in less distortion",
@@ -209,18 +217,39 @@ pub fn main() !void {
         }
     }
 
-    // Begin writing the DDS file
-    var output = cwd.createFile(args.positional.OUTPUT, .{}) catch |err| {
+    // Create the output file
+    var output_file = cwd.createFile(args.positional.OUTPUT, .{}) catch |err| {
         log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
         std.process.exit(1);
     };
     defer {
-        output.sync() catch |err| @panic(@errorName(err));
-        output.close();
+        output_file.sync() catch |err| @panic(@errorName(err));
+        output_file.close();
     }
 
+    // Create the output writer, which may or may not compress the data
+    const output_file_writer = output_file.writer();
+    const Compressor = std.compress.flate.deflate.Compressor(.gzip, std.fs.File.Writer);
+    var compressor: ?Compressor = null;
+    var compressor_writer: ?Compressor.Writer = null;
+    defer if (compressor) |*comp| comp.finish() catch |err| {
+        log.err("{s}: {s}: deflate failed", .{ args.positional.OUTPUT, @errorName(err) });
+        std.process.exit(1);
+    };
+    const writer = if (args.named.gz) |level| b: {
+        compressor = Compressor.init(
+            output_file_writer,
+            .{ .level = level },
+        ) catch |err| {
+            log.err("{s}: {s}: deflate failed", .{ args.positional.OUTPUT, @errorName(err) });
+            std.process.exit(1);
+        };
+        compressor_writer = compressor.?.writer();
+        break :b compressor_writer.?.any();
+    } else output_file_writer.any();
+
     // Write the four character code
-    output.writeAll(&Dds.four_cc) catch |err| {
+    writer.writeAll(&Dds.four_cc) catch |err| {
         log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
         std.process.exit(1);
     };
@@ -236,7 +265,7 @@ pub fn main() !void {
             .four_cc = Dds.Dxt10.four_cc,
         },
     };
-    output.writeAll(std.mem.asBytes(&header)) catch |err| {
+    writer.writeAll(std.mem.asBytes(&header)) catch |err| {
         log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
         std.process.exit(1);
     };
@@ -260,14 +289,14 @@ pub fn main() !void {
             .premultiplied = args.named.@"alpha-output" == .premultiplied,
         },
     };
-    output.writeAll(std.mem.asBytes(&dxt10)) catch |err| {
+    writer.writeAll(std.mem.asBytes(&dxt10)) catch |err| {
         log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
         std.process.exit(1);
     };
 
     // Encode and write the pixel data
     switch (subcommand) {
-        .raw => output.writeAll(raw) catch |err| {
+        .raw => writer.writeAll(raw) catch |err| {
             log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
             std.process.exit(1);
         },
@@ -279,6 +308,8 @@ pub fn main() !void {
                 std.process.exit(1);
             }
             params.bc7_uber_level = bc7.named.@"uber-level";
+
+            params.bc7enc_reduce_entropy = bc7.named.@"reduce-entropy";
 
             if (bc7.named.@"max-partitions-to-scan" > RdoBcParams.bc7enc_max_partitions) {
                 log.err("invalid value for max-partitions-to-scan", .{});
@@ -345,7 +376,7 @@ pub fn main() !void {
             const blocks_bytes = c.bc7enc_get_total_blocks_size_in_bytes(encoder);
             const blocks = c.bc7enc_get_blocks(encoder)[0..blocks_bytes];
 
-            output.writeAll(blocks) catch |err| {
+            writer.writeAll(blocks) catch |err| {
                 log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
                 std.process.exit(1);
             };
