@@ -14,6 +14,7 @@ A work in progress DDS utility for Zig.
 	* [ ] Y flip in raw mode (or remove from bc7 mode)
 	* [ ] Automatic mipmap generation
 	* [ ] Packing channels from separate images
+	* [ ] Double check for missing flags from bc7enc that affect bc7
 * [ ] Polish
 	* [ ] Check length of data when decoding
 	* [ ] Upstream encoder does useless copies, consdier working around

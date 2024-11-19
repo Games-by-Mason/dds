@@ -112,6 +112,10 @@ const rdo_command: Command = .{
             .long = "lambda",
             .default = .{ .value = 0.5 },
         }),
+        NamedArg.init(?u17, .{
+            .long = "lookback-window",
+            .default = .{ .value = null },
+        }),
         NamedArg.init(?f32, .{
             .description = "bc7 manually set smooth block error scale factor, higher values result in less distortion",
             .long = "smooth-block-error-scale",
@@ -336,14 +340,23 @@ pub fn main() !void {
             if (bc7.subcommand) |bc7_subcommand| switch (bc7_subcommand) {
                 .rdo => |rdo| {
                     if ((rdo.named.lambda < 0.0) or (rdo.named.lambda > 500.0)) {
-                        log.err("invalid value for rdo-lambda", .{});
+                        log.err("invalid value for lambda", .{});
                         std.process.exit(1);
                     }
                     params.rdo_lambda = rdo.named.lambda;
 
+                    if (rdo.named.@"lookback-window") |lookback_window| {
+                        if (lookback_window < RdoBcParams.min_lookback_window_size) {
+                            log.err("invalid value for lookback-window", .{});
+                            std.process.exit(1);
+                        }
+                        params.lookback_window_size = lookback_window;
+                        params.custom_lookback_window_size = true;
+                    }
+
                     if (rdo.named.@"smooth-block-error-scale") |v| {
                         if ((v < 1.0) or (v > 500.0)) {
-                            log.err("invalid value for rdo-smooth-block-error-scale", .{});
+                            log.err("invalid value for smooth-block-error-scale", .{});
                             std.process.exit(1);
                         }
                         params.rdo_smooth_block_error_scale = v;
@@ -356,7 +369,7 @@ pub fn main() !void {
                     params.bc7enc_rdo_bc7_pbit1_weighting = rdo.named.@"pbit1-weighting";
 
                     if ((rdo.named.@"max-smooth-block-std-dev") < 0.000125 or (rdo.named.@"max-smooth-block-std-dev" > 256.0)) {
-                        log.err("invalid value for rdo-max-smooth-block-std-dev", .{});
+                        log.err("invalid value for max-smooth-block-std-dev", .{});
                         std.process.exit(1);
                     }
                     params.rdo_max_smooth_block_std_dev = rdo.named.@"max-smooth-block-std-dev";
@@ -388,6 +401,7 @@ const RdoBcParams = extern struct {
     const bc7enc_max_partitions = 64;
     const bc7enc_max_uber_level = 4;
     const max_level = 18;
+    const min_lookback_window_size = 8;
 
     const Bc345ModeMask = enum(u32) {
         const bc4_use_all_modes: @This() = .bc4_default_search_rad;
