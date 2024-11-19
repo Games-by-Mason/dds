@@ -15,9 +15,9 @@ const c = @cImport({
 
 const max_file_len = 4294967296;
 
-const Metric = enum {
+const ColorSpace = enum {
     linear,
-    perceptual,
+    srgb,
 };
 
 const raw_command: Command = .{
@@ -74,11 +74,6 @@ const bc7_command: Command = .{
     .name = "bc7",
     .description = "Encode as bc7.",
     .named_args = &.{
-        NamedArg.init(Metric, .{
-            .description = "bc7 metric, ignored when RDO is in use",
-            .long = "metric",
-            .default = .{ .value = .linear },
-        }),
         NamedArg.init(u8, .{
             .description = "bc7 quality level, defaults to highest",
             .long = "uber-level",
@@ -112,6 +107,10 @@ const command: Command = .{
         NamedArg.init(bool, .{
             .long = "y-flip",
             .default = .{ .value = false },
+        }),
+        NamedArg.init(ColorSpace, .{
+            .long = "color-space",
+            .default = .{ .value = .srgb },
         }),
     },
     .positional_args = &.{
@@ -216,14 +215,20 @@ pub fn main() !void {
 
     const dxt10: Dds.Dxt10 = switch (subcommand) {
         .raw => .{
-            .dxgi_format = .r8g8b8a8_unorm_srgb,
+            .dxgi_format = switch (args.named.@"color-space") {
+                .srgb => .r8g8b8a8_unorm_srgb,
+                .linear => .r8g8b8a8_unorm,
+            },
             .resource_dimension = .texture_2d,
             .misc_flags_2 = .{
                 .straight = true,
             },
         },
         .bc7 => .{
-            .dxgi_format = .bc7_unorm_srgb,
+            .dxgi_format = switch (args.named.@"color-space") {
+                .srgb => .bc7_unorm_srgb,
+                .linear => .bc7_unorm,
+            },
             .resource_dimension = .texture_2d,
             .misc_flags_2 = .{
                 .straight = true,
@@ -254,7 +259,8 @@ pub fn main() !void {
                 std.process.exit(1);
             }
             params.bc7enc_max_partitions_to_scan = bc7.named.@"max-partitions-to-scan";
-            params.perceptual = bc7.named.metric == .perceptual;
+            // Ignored when using RDO, should be fine to set anyway
+            params.perceptual = args.named.@"color-space" == .srgb;
             params.y_flip = args.named.@"y-flip";
             params.bc7enc_mode6_only = bc7.named.@"mode6-only";
 
