@@ -20,9 +20,79 @@ const ColorSpace = enum {
     srgb,
 };
 
+const Alpha = enum {
+    straight,
+    premultiplied,
+};
+
+const command: Command = .{
+    .name = "dds",
+    .description = "Converts PNG to DDS.",
+    .named_args = &.{
+        NamedArg.init(bool, .{
+            .long = "y-flip",
+            .default = .{ .value = false },
+        }),
+        NamedArg.init(ColorSpace, .{
+            .long = "color-space",
+            .default = .{ .value = .srgb },
+        }),
+        NamedArg.init(Alpha, .{
+            .long = "alpha-input",
+            .default = .{ .value = .straight },
+        }),
+        NamedArg.init(Alpha, .{
+            .long = "alpha-output",
+            .default = .{ .value = .premultiplied },
+        }),
+    },
+    .positional_args = &.{
+        PositionalArg.init([]const u8, .{
+            .meta = "INPUT",
+        }),
+        PositionalArg.init([]const u8, .{
+            .meta = "OUTPUT",
+        }),
+    },
+    .subcommands = &.{
+        raw_command,
+        bc7_command,
+    },
+};
+
 const raw_command: Command = .{
     .name = "raw",
     .description = "Store the image raw.",
+};
+
+const bc7_command: Command = .{
+    .name = "bc7",
+    .description = "Encode as bc7.",
+    .named_args = &.{
+        NamedArg.init(u8, .{
+            .description = "bc7 quality level, defaults to highest",
+            .long = "uber-level",
+            .default = .{ .value = RdoBcParams.bc7enc_max_uber_level },
+        }),
+        NamedArg.init(u8, .{
+            .description = "bc7 partitions to scan in mode 1, defaults to highest",
+            .long = "max-partitions-to-scan",
+            .default = .{ .value = RdoBcParams.bc7enc_max_partitions },
+        }),
+        NamedArg.init(bool, .{
+            .long = "mode6-only",
+            .default = .{ .value = false },
+        }),
+        NamedArg.init(?u32, .{
+            .long = "max-threads",
+            .default = .{ .value = null },
+        }),
+        NamedArg.init(bool, .{
+            .long = "status-output",
+            .default = .{ .value = false },
+        }),
+    },
+    .subcommands = &.{rdo_command},
 };
 
 const rdo_command: Command = .{
@@ -70,67 +140,9 @@ const rdo_command: Command = .{
     },
 };
 
-const bc7_command: Command = .{
-    .name = "bc7",
-    .description = "Encode as bc7.",
-    .named_args = &.{
-        NamedArg.init(u8, .{
-            .description = "bc7 quality level, defaults to highest",
-            .long = "uber-level",
-            .default = .{ .value = RdoBcParams.bc7enc_max_uber_level },
-        }),
-        NamedArg.init(u8, .{
-            .description = "bc7 partitions to scan in mode 1, defaults to highest",
-            .long = "max-partitions-to-scan",
-            .default = .{ .value = RdoBcParams.bc7enc_max_partitions },
-        }),
-        NamedArg.init(bool, .{
-            .long = "mode6-only",
-            .default = .{ .value = false },
-        }),
-        NamedArg.init(?u32, .{
-            .long = "max-threads",
-            .default = .{ .value = null },
-        }),
-        NamedArg.init(bool, .{
-            .long = "status-output",
-            .default = .{ .value = false },
-        }),
-    },
-    .subcommands = &.{rdo_command},
-};
-
-const command: Command = .{
-    .name = "dds",
-    .description = "Converts PNG to DDS.",
-    .named_args = &.{
-        NamedArg.init(bool, .{
-            .long = "y-flip",
-            .default = .{ .value = false },
-        }),
-        NamedArg.init(ColorSpace, .{
-            .long = "color-space",
-            .default = .{ .value = .srgb },
-        }),
-    },
-    .positional_args = &.{
-        PositionalArg.init([]const u8, .{
-            .meta = "INPUT",
-        }),
-        PositionalArg.init([]const u8, .{
-            .meta = "OUTPUT",
-        }),
-    },
-    .subcommands = &.{
-        raw_command,
-        bc7_command,
-    },
-};
-
 pub fn main() !void {
-    comptime assert(builtin.cpu.arch.endian() == .little);
-
     // Setup
+    comptime assert(builtin.cpu.arch.endian() == .little);
     defer std.process.cleanExit();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
@@ -141,6 +153,16 @@ pub fn main() !void {
     defer arg_iter.deinit();
     const args = command.parseOrExit(allocator, &arg_iter);
     defer command.parseFree(args);
+
+    const subcommand = args.subcommand orelse {
+        log.err("subcommand not specified", .{});
+        std.process.exit(1);
+    };
+
+    if (args.named.@"alpha-input" == .premultiplied and args.named.@"alpha-output" == .straight) {
+        log.err("conversion from premultiplied to straight alpha is not supported", .{});
+        std.process.exit(1);
+    }
 
     const cwd = std.fs.cwd();
 
@@ -156,11 +178,6 @@ pub fn main() !void {
         std.process.exit(1);
     };
     defer allocator.free(input_bytes);
-
-    const subcommand = args.subcommand orelse {
-        log.err("subcommand not specified", .{});
-        std.process.exit(1);
-    };
 
     var width_c: c_int = 0;
     var height_c: c_int = 0;
@@ -181,6 +198,18 @@ pub fn main() !void {
     const height: u32 = @intCast(height_c);
     const raw = raw_c[0 .. width * height * 4];
 
+    // Perform alpha conversions
+    if (args.named.@"alpha-output" == .premultiplied and args.named.@"alpha-input" == .straight) {
+        var px: usize = 0;
+        while (px < width * height * 4) : (px += 4) {
+            const a: f32 = @as(f32, @floatFromInt(raw[px + 3])) / 255.0;
+            raw[px + 0] = @intFromFloat(@as(f32, @floatFromInt(raw[px + 0])) * a);
+            raw[px + 1] = @intFromFloat(@as(f32, @floatFromInt(raw[px + 1])) * a);
+            raw[px + 2] = @intFromFloat(@as(f32, @floatFromInt(raw[px + 2])) * a);
+        }
+    }
+
+    // Begin writing the DDS file
     var output = cwd.createFile(args.positional.OUTPUT, .{}) catch |err| {
         log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
         std.process.exit(1);
@@ -197,7 +226,6 @@ pub fn main() !void {
     };
 
     // Write the header
-    comptime assert(builtin.cpu.arch.endian() == .little);
     const header: Dds.Header = .{
         .height = @intCast(height),
         .width = @intCast(width),
@@ -213,26 +241,23 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    const dxt10: Dds.Dxt10 = switch (subcommand) {
-        .raw => .{
-            .dxgi_format = switch (args.named.@"color-space") {
-                .srgb => .r8g8b8a8_unorm_srgb,
-                .linear => .r8g8b8a8_unorm,
-            },
-            .resource_dimension = .texture_2d,
-            .misc_flags_2 = .{
-                .straight = true,
-            },
+    // Write the DXT10 header
+    const dxgi_format: Dds.Dxt10.DxgiFormat = switch (args.named.@"color-space") {
+        .srgb => switch (subcommand) {
+            .raw => .r8g8b8a8_unorm_srgb,
+            .bc7 => .bc7_unorm_srgb,
         },
-        .bc7 => .{
-            .dxgi_format = switch (args.named.@"color-space") {
-                .srgb => .bc7_unorm_srgb,
-                .linear => .bc7_unorm,
-            },
-            .resource_dimension = .texture_2d,
-            .misc_flags_2 = .{
-                .straight = true,
-            },
+        .linear => switch (subcommand) {
+            .raw => .r8g8b8a8_unorm,
+            .bc7 => .bc7_unorm,
+        },
+    };
+    const dxt10: Dds.Dxt10 = .{
+        .dxgi_format = dxgi_format,
+        .resource_dimension = .texture_2d,
+        .misc_flags_2 = .{
+            .straight = args.named.@"alpha-output" == .straight,
+            .premultiplied = args.named.@"alpha-output" == .premultiplied,
         },
     };
     output.writeAll(std.mem.asBytes(&dxt10)) catch |err| {
@@ -240,6 +265,7 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
+    // Encode and write the pixel data
     switch (subcommand) {
         .raw => output.writeAll(raw) catch |err| {
             log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
