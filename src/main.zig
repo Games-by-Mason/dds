@@ -29,10 +29,6 @@ const command: Command = .{
     .name = "dds",
     .description = "Converts PNG to DDS.",
     .named_args = &.{
-        NamedArg.init(bool, .{
-            .long = "y-flip",
-            .default = .{ .value = false },
-        }),
         NamedArg.init(ColorSpace, .{
             .long = "color-space",
             .default = .{ .value = .srgb },
@@ -73,9 +69,13 @@ const bc7_command: Command = .{
     .name = "bc7",
     .description = "Encode as bc7.",
     .named_args = &.{
+        NamedArg.init(bool, .{
+            .long = "flip-y",
+            .default = .{ .value = false },
+        }),
         NamedArg.init(u8, .{
             .description = "bc7 quality level, defaults to highest",
-            .long = "uber-level",
+            .long = "uber",
             .default = .{ .value = RdoBcParams.bc7enc_max_uber_level },
         }),
         NamedArg.init(bool, .{
@@ -88,7 +88,7 @@ const bc7_command: Command = .{
             .default = .{ .value = RdoBcParams.bc7enc_max_partitions },
         }),
         NamedArg.init(bool, .{
-            .long = "mode6-only",
+            .long = "mode-6-only",
             .default = .{ .value = false },
         }),
         NamedArg.init(?u32, .{
@@ -122,7 +122,7 @@ const rdo_command: Command = .{
             .default = .{ .value = 15.0 },
         }),
         NamedArg.init(bool, .{
-            .long = "quant-mode6-endpoints",
+            .long = "quantize-mode6-endpoints",
             .default = .{ .value = true },
         }),
         NamedArg.init(bool, .{
@@ -142,7 +142,7 @@ const rdo_command: Command = .{
             .default = .{ .value = 18.0 },
         }),
         NamedArg.init(bool, .{
-            .long = "try-2-matches",
+            .long = "try-two-matches",
             .default = .{ .value = true },
         }),
         NamedArg.init(bool, .{
@@ -307,11 +307,11 @@ pub fn main() !void {
         .bc7 => |bc7| {
             var params: RdoBcParams = .{};
 
-            if (bc7.named.@"uber-level" > RdoBcParams.bc7enc_max_uber_level) {
-                log.err("invalid value for uber-level", .{});
+            if (bc7.named.uber > RdoBcParams.bc7enc_max_uber_level) {
+                log.err("invalid value for uber", .{});
                 std.process.exit(1);
             }
-            params.bc7_uber_level = bc7.named.@"uber-level";
+            params.bc7_uber_level = bc7.named.uber;
 
             params.bc7enc_reduce_entropy = bc7.named.@"reduce-entropy";
 
@@ -322,8 +322,8 @@ pub fn main() !void {
             params.bc7enc_max_partitions_to_scan = bc7.named.@"max-partitions-to-scan";
             // Ignored when using RDO, should be fine to set anyway
             params.perceptual = args.named.@"color-space" == .srgb;
-            params.y_flip = args.named.@"y-flip";
-            params.bc7enc_mode6_only = bc7.named.@"mode6-only";
+            params.y_flip = bc7.named.@"flip-y";
+            params.bc7enc_mode6_only = bc7.named.@"mode-6-only";
 
             if (bc7.named.@"max-threads") |v| {
                 if (v == 0) {
@@ -363,7 +363,7 @@ pub fn main() !void {
                         params.custom_rdo_smooth_block_error_scale = true;
                     }
 
-                    params.bc7enc_rdo_bc7_quant_mode6_endpoints = rdo.named.@"quant-mode6-endpoints";
+                    params.bc7enc_rdo_bc7_quant_mode6_endpoints = rdo.named.@"quantize-mode6-endpoints";
                     params.bc7enc_rdo_bc7_weight_modes = rdo.named.@"weight-modes";
                     params.bc7enc_rdo_bc7_weight_low_frequency_partitions = rdo.named.@"weight-low-frequency-partitions";
                     params.bc7enc_rdo_bc7_pbit1_weighting = rdo.named.@"pbit1-weighting";
@@ -373,7 +373,7 @@ pub fn main() !void {
                         std.process.exit(1);
                     }
                     params.rdo_max_smooth_block_std_dev = rdo.named.@"max-smooth-block-std-dev";
-                    params.rdo_try_2_matches = rdo.named.@"try-2-matches";
+                    params.rdo_try_2_matches = rdo.named.@"try-two-matches";
                     params.rdo_ultrasmooth_block_handling = rdo.named.@"ultrasmooth-block-handling";
                 },
             };
