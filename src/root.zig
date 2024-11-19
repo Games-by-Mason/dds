@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 
-const four_cc = "DDS ";
+pub const four_cc = "DDS ".*;
 
 pub const Header = extern struct {
     pub const PixelFormat = extern struct {
@@ -22,11 +22,11 @@ pub const Header = extern struct {
         size: u32 = @sizeOf(PixelFormat),
         flags: @This().Flags = .{},
         four_cc: [4]u8 = .{0} ** 4,
-        rgb_bit_count: u32,
-        r_bit_mask: u32,
-        g_bit_mask: u32,
-        b_bit_mask: u32,
-        a_bit_mask: u32,
+        rgb_bit_count: u32 = 0,
+        r_bit_mask: u32 = 0,
+        g_bit_mask: u32 = 0,
+        b_bit_mask: u32 = 0,
+        a_bit_mask: u32 = 0,
     };
 
     pub const Flags = packed struct(u32) {
@@ -86,6 +86,8 @@ pub const Header = extern struct {
 };
 
 pub const Dxt10 = extern struct {
+    pub const four_cc = "DX10".*;
+
     pub const DxgiFormat = enum(u32) {
         unknown = 0,
         r32g32b32a32_typeless = 1,
@@ -206,7 +208,9 @@ pub const Dxt10 = extern struct {
         p208 = 130,
         v208 = 131,
         v408 = 132,
+        /// Not supported by encoder
         sampler_feedback_min_mip_opaque = 133,
+        /// Not supported by encoder
         sampler_feedback_mip_region_used_opaque = 134,
         force_uint = 0xffffffff,
         _,
@@ -215,17 +219,31 @@ pub const Dxt10 = extern struct {
     pub const ResourceDimension = enum(u32) {
         unknown = 0,
         buffer = 1,
-        texture1d = 2,
-        texture2d = 3,
-        texture3d = 4,
+        texture_1d = 2,
+        texture_2d = 3,
+        texture_3d = 4,
         _,
+    };
+
+    pub const MiscFlags = packed struct(u32) {
+        _padding0: u2 = 0,
+        texture_cube: bool = false,
+        _padding: u29 = 0,
+    };
+
+    pub const MiscFlags2 = packed struct(u32) {
+        straight: bool = false,
+        premultiplied: bool = false,
+        @"opaque": bool = false,
+        custom: bool = false,
+        _padding0: u28 = 0,
     };
 
     dxgi_format: DxgiFormat,
     resource_dimension: ResourceDimension,
-    misc_flag: u32,
-    array_size: u32,
-    misc_flags2: u32,
+    misc_flag: MiscFlags = .{},
+    array_size: u32 = 0,
+    misc_flags_2: MiscFlags2 = .{},
 };
 
 header: *const Header,

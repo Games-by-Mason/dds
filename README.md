@@ -1,14 +1,20 @@
 # DDS Zig
 
-A **work in progress** DDS utility for Zig.
+A work in progress DDS utility for Zig.
 
 # Plan
 * [x] Provide DDS header structures for reading DDS files in Zig
-* [x] Support converting PNGs to uncompressed DDS files with and without alpha
-* [ ] Support converting PNGs to BC7 compressed DDS files using [bc7enc_rdo_zig](https://github.com/Games-by-Mason/bc7enc_rdo_zig)
-* [ ] Look into whether other modes are needed for alpha, no alpha, normal maps, etc
-* [ ] Look into srgb/alpha premul conversions
-* [ ] Support applying lossless compression to the resulting DDS
-* [ ] Support automatic mipmap generation
-* [ ] Check length of data when decoding
-* [ ] Look into why lodepng fails UBSAN
+* [x] Support encoding raw DDS files
+* [x] Support encoding BC7 DDS files using [bc7enc_rdo](https://github.com/richgel999/bc7enc_rdo)
+* [ ] Get flags right/support conversions for...
+	* [ ] Alpha premul
+	* [ ] SRGB (keep in mind may not be supported w/ RDO)
+* [ ] Support useful features
+	* [ ] Lossless compression on export
+	* [ ] Y flip in raw mode (or remove from bc7 mode)
+	* [ ] Automatic mipmap generation
+* [ ] Polish
+	* [ ] Check length of data when decoding
+	* [ ] Upstream encoder does useless copies, consdier working around
+	* [ ] Some upstream libraries fail safety checks in debug mode
+* [ ] Document usage

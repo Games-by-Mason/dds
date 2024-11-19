@@ -11,27 +11,42 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Build lodepng
-    const bc7enc_zig = b.dependency("bc7enc_rdo", .{
+    // Build bc7enc
+    const bc7enc = b.dependency("bc7enc_rdo", .{});
+    const libbc7enc = b.addStaticLibrary(.{
+        .name = "bc7enc",
+        .target = target,
+        // Doesn't currently pass safety checks
+        .optimize = switch (optimize) {
+            .ReleaseSmall => .ReleaseSmall,
+            else => .ReleaseFast,
+        },
+    });
+    libbc7enc.addIncludePath(bc7enc.path(""));
+    libbc7enc.addCSourceFiles(.{
+        .root = bc7enc.path(""),
+        .files = &.{
+            "bc7enc.cpp",
+            "bc7decomp.cpp",
+            "bc7decomp_ref.cpp",
+            "lodepng.cpp",
+            "rgbcx.cpp",
+            "utils.cpp",
+            "ert.cpp",
+            "rdo_bc_encoder.cpp",
+        },
+    });
+    libbc7enc.linkLibCpp();
+    libbc7enc.installHeadersDirectory(bc7enc.path("."), "bc7enc", .{});
+
+    // Get structopt
+    const structopt = b.dependency("structopt", .{
         .target = target,
         .optimize = optimize,
     });
-    const bc7enc = bc7enc_zig.builder.dependency("bc7enc_rdo", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const lodepng = b.addStaticLibrary(.{
-        .name = "lodepng",
-        .target = target,
-        // Lodepng fails UBSAN
-        .optimize = .ReleaseFast,
-    });
-    const rename_lodepng = b.addWriteFiles();
-    const lodepng_c = rename_lodepng.addCopyFile(bc7enc.path("lodepng.cpp"), "lodepng.c");
-    lodepng.addCSourceFile(.{ .file = lodepng_c });
-    lodepng.addIncludePath(bc7enc.path(""));
-    lodepng.installHeader(bc7enc.path("lodepng.h"), "lodepng.h");
-    lodepng.linkLibC();
+
+    // Get stb
+    const stb = b.dependency("stb", .{});
 
     // Build the command line tool
     const exe = b.addExecutable(.{
@@ -41,16 +56,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe.root_module.addImport("Dds", lib);
-    exe.linkLibrary(lodepng);
-
-    const structopt = b.dependency("structopt", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    exe.linkLibrary(libbc7enc);
+    exe.addCSourceFile(.{ .file = b.path("src/dds.cpp") });
+    exe.addIncludePath(b.path("src"));
+    exe.addIncludePath(stb.path(""));
     exe.root_module.addImport("structopt", structopt.module("structopt"));
-
     b.installArtifact(exe);
 
+    // Create the run command
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {

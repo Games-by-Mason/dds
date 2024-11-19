@@ -4,12 +4,17 @@
     .minimum_zig_version = "0.14.0-dev.1820+ea527f7a8",
     .dependencies = .{
         .bc7enc_rdo = .{
-            .url = "https://github.com/Games-by-Mason/bc7enc_rdo_zig/archive/f1c0638a2c511b167a752a1ac31d9b49a2a0c1c1.tar.gz",
-            .hash = "1220fb99784b75b4ad7493972988bfcce42418d71e8f52cdf7e23dbe834d38fdc841",
+            // Mirror available: https://github.com/Games-by-Mason/bc7enc_rdo
+            .url = "https://github.com/richgel999/bc7enc_rdo/archive/e6990bc11829c072d9f9e37296f3335072aab4e4.tar.gz",
+            .hash = "122015b6b9371467091eefd4720d363feea707bc700d2676bda2fe2b55629a18b435",
         },
         .structopt = .{
-            .url = "https://github.com/Games-by-Mason/structopt/archive/5bc9d351de473812a7b0c65f2f2072341107793f.zip",
-            .hash = "12209b09cadda994667644d5d2b7b0929d6b6086577844f9a07c0a9794bd73d72d63",
+            .url = "https://github.com/Games-by-Mason/structopt/archive/5d51b7e808a795a6bc676b299d7b984a323a98d5.tar.gz",
+            .hash = "122092841f6dc466efaf948fbabbcffc84e70da9f4bce59df216b986eb23a78f3054",
+        },
+        .stb = .{
+            .url = "https://github.com/nothings/stb/archive/5c205738c191bcb0abc65c4febfa9bd25ff35234.tar.gz",
+            .hash = "122082911aadaef3c836d3833f7c60386ee1ee46feffb6c54785f784801c32212aaa",
         },
     },
     .paths = .{
