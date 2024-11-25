@@ -1,4 +1,5 @@
 const std = @import("std");
+const ArrayListUnmanaged = std.ArrayListUnmanaged;
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Ktx2 = @import("Ktx2");
@@ -20,6 +21,24 @@ const Alpha = enum {
     premultiplied,
 };
 
+const ZlibLevel = enum(u4) {
+    const StdLevel = std.compress.flate.deflate.Level;
+
+    fastest = @intFromEnum(StdLevel.fast),
+    smallest = @intFromEnum(StdLevel.best),
+
+    @"4" = @intFromEnum(StdLevel.level_4),
+    @"5" = @intFromEnum(StdLevel.level_5),
+    @"6" = @intFromEnum(StdLevel.level_6),
+    @"7" = @intFromEnum(StdLevel.level_7),
+    @"8" = @intFromEnum(StdLevel.level_8),
+    @"9" = @intFromEnum(StdLevel.level_9),
+
+    pub fn toStdLevel(self: @This()) StdLevel {
+        return @enumFromInt(@intFromEnum(self));
+    }
+};
+
 const command: Command = .{
     .name = "zex",
     .description = "Converts images to KTX2.",
@@ -36,8 +55,8 @@ const command: Command = .{
             .long = "alpha-output",
             .default = .{ .value = .premultiplied },
         }),
-        NamedArg.init(?std.compress.flate.deflate.Level, .{
-            .long = "gz",
+        NamedArg.init(?ZlibLevel, .{
+            .long = "zlib",
             .default = .{ .value = null },
         }),
     },
@@ -287,7 +306,38 @@ pub fn main() !void {
         },
     };
 
-    // Create the output file
+    // Compress the data if needed
+    const compressed = if (args.named.zlib) |level| b: {
+        var compressed = ArrayListUnmanaged(u8).initCapacity(allocator, encoded.len) catch |err| {
+            log.err("{s}: deflate failed: {s}", .{ args.positional.OUTPUT, @errorName(err) });
+            std.process.exit(1);
+        };
+        defer compressed.deinit(allocator);
+
+        const Compressor = std.compress.flate.deflate.Compressor(.zlib, @TypeOf(compressed).Writer);
+        var compressor = Compressor.init(
+            compressed.writer(allocator),
+            .{ .level = level.toStdLevel() },
+        ) catch |err| {
+            log.err("{s}: deflate failed: {s}", .{ args.positional.OUTPUT, @errorName(err) });
+            std.process.exit(1);
+        };
+        _ = compressor.write(encoded) catch |err| {
+            log.err("{s}: deflate failed: {s}", .{ args.positional.OUTPUT, @errorName(err) });
+            std.process.exit(1);
+        };
+        compressor.finish() catch |err| {
+            log.err("{s}: deflate failed: {s}", .{ args.positional.OUTPUT, @errorName(err) });
+            std.process.exit(1);
+        };
+        break :b compressed.toOwnedSlice(allocator) catch |err| {
+            log.err("{s}: deflate failed: {s}", .{ args.positional.OUTPUT, @errorName(err) });
+            std.process.exit(1);
+        };
+    } else encoded;
+    defer if (args.named.zlib != null) allocator.free(compressed);
+
+    // Create the output file writer
     var output_file = cwd.createFile(args.positional.OUTPUT, .{}) catch |err| {
         log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
         std.process.exit(1);
@@ -296,27 +346,7 @@ pub fn main() !void {
         output_file.sync() catch |err| @panic(@errorName(err));
         output_file.close();
     }
-
-    // Create the output writer, which may or may not compress the data
-    const output_file_writer = output_file.writer();
-    const Compressor = std.compress.flate.deflate.Compressor(.gzip, std.fs.File.Writer);
-    var compressor: ?Compressor = null;
-    var compressor_writer: ?Compressor.Writer = null;
-    defer if (compressor) |*comp| comp.finish() catch |err| {
-        log.err("{s}: {s}: deflate failed", .{ args.positional.OUTPUT, @errorName(err) });
-        std.process.exit(1);
-    };
-    const writer = if (args.named.gz) |level| b: {
-        compressor = Compressor.init(
-            output_file_writer,
-            .{ .level = level },
-        ) catch |err| {
-            log.err("{s}: {s}: deflate failed", .{ args.positional.OUTPUT, @errorName(err) });
-            std.process.exit(1);
-        };
-        compressor_writer = compressor.?.writer();
-        break :b compressor_writer.?.any();
-    } else output_file_writer.any();
+    const writer = output_file.writer();
 
     // Write the header
     const samples: u8 = switch (encoding) {
@@ -345,14 +375,14 @@ pub fn main() !void {
         .layer_count = 0,
         .face_count = 1,
         .level_count = .fromInt(1),
-        .supercompression_scheme = .none,
+        .supercompression_scheme = if (args.named.zlib != null) .zlib else .none,
         .index = index,
     }) catch |err| {
         log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
         std.process.exit(1);
     };
 
-    const level_alignment: u8 = switch (encoding) {
+    const level_alignment: u8 = if (args.named.zlib != null) 1 else switch (encoding) {
         .raw => 1,
         .bc7 => 16,
     };
@@ -361,7 +391,7 @@ pub fn main() !void {
     const first_level_padding = first_level_offset - first_level_padding_offset;
     writer.writeStruct(Ktx2.Level{
         .byte_offset = first_level_offset,
-        .byte_length = encoded.len,
+        .byte_length = compressed.len,
         .uncompressed_byte_length = encoded.len,
     }) catch |err| {
         log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
@@ -397,7 +427,7 @@ pub fn main() !void {
         },
         .texel_block_dimension_2 = .fromInt(1),
         .texel_block_dimension_3 = .fromInt(1),
-        .bytes_plane_0 = switch (encoding) {
+        .bytes_plane_0 = if (args.named.zlib != null) 0 else switch (encoding) {
             .raw => 4,
             .bc7 => 16,
         },
@@ -459,12 +489,12 @@ pub fn main() !void {
         },
     }
 
-    // Write the encoded data
+    // Write the compressed data
     writer.writeByteNTimes(0, first_level_padding) catch |err| {
         log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
         std.process.exit(1);
     };
-    writer.writeAll(encoded) catch |err| {
+    writer.writeAll(compressed) catch |err| {
         log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
         std.process.exit(1);
     };
