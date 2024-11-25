@@ -254,7 +254,7 @@ pub const Error = error{InvalidDds};
 
 pub fn init(bytes: []align(@alignOf(u32)) const u8) Error!@This() {
     comptime assert(builtin.cpu.arch.endian() == .little);
-    if (!std.mem.eql(u8, bytes[0..four_cc.len], four_cc)) {
+    if (!std.mem.eql(u8, bytes[0..four_cc.len], &four_cc)) {
         return Error.InvalidDds;
     }
 
