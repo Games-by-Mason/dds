@@ -56,23 +56,7 @@ I recommend [Tacent View](https://github.com/bluescan/tacentview) for inspecting
 * [KTX2 spec](https://registry.khronos.org/KTX/specs/2.0/ktxspec.v2.html#prohibitedFormats)
 * [Data Format Descriptor spec](https://registry.khronos.org/DataFormat/specs/1.3/dataformat.1.3.html)
 * [Reference KTX implementation and validator](https://github.com/KhronosGroup/KTX-Software)
-Output is tested with 
 
 ## Zex is a work in progress
 
-Important features that are planned but not yet implemented. When I finish implementing these, I'll mark it as v1.0.0:
-* [ ] Supercompression
-	* The command line tool currently supports compressing the entire KTX2 file. This is an artifact from when Zex was a DDS tool. Instead, we should take advantage of KTX2's support for supercompression.
-* [ ] Automatic mipmap generation
-* [ ] Packing channels from separate images
-* [ ] Cubemap support
-* [ ] HDR support
-
-Possible features that need more thought:
-* [ ] Raw images with fewer than 4 channels
-* [ ] Other block based compression formats (e.g. for normal maps)
-
-Miscellaneous polish
-* [ ] Some upstream libraries fail safety checks in debug mode, we could investigate and upstream fixes
-* [ ] This library may make a good case for required subcommands in structopt
-* [ ] It's worth verifying the struct we use to pass arguments to the BC7 encoder is guaranteed to match the library's layout
+Planned features for 1.0 can be found [here](https://github.com/Games-by-Mason/Zex/milestone/1).
