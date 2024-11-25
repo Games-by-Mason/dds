@@ -41,6 +41,8 @@ Supports premultiplying alpha while encoding.
 
 Output files are stored as [KTX2](https://www.khronos.org/ktx/).
 
+Supercompression with KTX2's zlib mode is supported.
+
 ### Library
 
 This package exports a Ktx2 library for loading KTX2 files in engine.
