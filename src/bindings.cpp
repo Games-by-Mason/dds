@@ -2,7 +2,6 @@
 #include <bc7enc/rdo_bc_encoder.h>
 #include <bc7enc/utils.h>
 
-
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
@@ -35,11 +34,11 @@ extern "C" {
 		return true;
 	}
 
-	uint8_t * bc7enc_get_blocks(rdo_bc::rdo_bc_encoder * encoder) {
+	uint8_t * bc7enc_getBlocks(rdo_bc::rdo_bc_encoder * encoder) {
 		return (uint8_t *)encoder->get_blocks();
 	}
 
-	uint32_t bc7enc_get_total_blocks_size_in_bytes(rdo_bc::rdo_bc_encoder * encoder) {
+	uint32_t bc7enc_getTotalBlocksSizeInBytes(rdo_bc::rdo_bc_encoder * encoder) {
 		return encoder->get_total_blocks_size_in_bytes();
 	}
 }

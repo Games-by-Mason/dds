@@ -1,27 +1,78 @@
-# DDS Zig
+# Zex
 
-A work in progress DDS utility for Zig.
+A texture utility for Zig.
 
-# Plan
-* [x] Provide DDS header structures for reading DDS files in Zig
-* [x] Support encoding raw DDS files
-* [x] Support encoding BC7 DDS files using [bc7enc_rdo](https://github.com/richgel999/bc7enc_rdo)
-* [x] Get flags right/support conversions for...
-	* [x] Alpha premul
-	* [x] SRGB (keep in mind may not be supported w/ RDO)
-* [ ] Support useful features
-	* [x] Lossless compression on export
-	* [ ] Y flip in raw mode (or remove from bc7 mode)
-	* [ ] Automatic mipmap generation
-	* [ ] Packing channels from separate images
-	* [ ] Double check for missing flags from bc7enc that affect bc7
-* [ ] Polish
-	* [ ] Check length of data when decoding
-		* Likely accomplish this by only supporting DXT10 DDS files in the high level part of the decoder
-	* [ ] Upstream encoder does useless copies of the source image, consider working around
-		* Does not seem to be bottleneck in practice though
-	* [ ] Some upstream libraries fail safety checks in debug mode
-	* [ ] Experiment with speed and compression ratios of deflate vs other compression schemes
-	* [ ] Double check alpha output in render doc
-	* [ ] Consider supporting required subcommands in structopt
-* [ ] Document usage
+## Rationale
+
+Games typically ship with a lot of texture data. It may be tempting to ship texture data as images, but image formats are typically a poor representation for texture data:
+
+* Image formats typically must be uncompressed before being uploaded to the GPU
+* Image formats typically can't contain prebaked [mipmaps](https://en.wikipedia.org/wiki/Mipmap)
+* Image formats typically can't contain [cubemaps](https://en.wikipedia.org/wiki/Cube_mapping)
+* Image formats typically do not indicate if their alpha is [premultiplied](https://tomforsyth1000.github.io/blog.wiki.html#%5B%5BPremultiplied%20alpha%5D%5D)
+* etc...
+
+Texture formats like Khronos' [KTX](https://www.khronos.org/ktx/) and Microsoft's [DDS](https://learn.microsoft.com/en-us/windows/win32/direct3ddds/dx-graphics-dds-pguide) are designed for exactly this use case.
+
+Not only do these texture formats support the aforementioned features, they also support lossy GPU compression formats that don't need to be decompressed because the GPU can sample from the compressed data, increasing performance while decreasing memory usage.
+
+While convenient, these formats do not provide compression ratios competitive with normal image formats, so it is typical to apply additional lossless compression in a strategy called "supercompression". Typically one would attempt to apply the former lossy compression in such a way as to reduce entropy increasing the effectiveness of the lossless compression.
+
+This high level strategy is effective, but it's hard to come by tools that make employing it easy, so it's typical for small games to either reinvent the wheel, or miss out on the benefits of these formats entirely. This library aims to fill that gap.
+
+In particular, Zig is uniquely suited to make this process easy via its build system which can be extended with tools like Zex to compress textures at build time, relying on the build system for caching and parallelization.
+
+## What's Provided
+
+### Command Line Tool
+
+The command line tool encodes can be called manually, or automatically from Zig's build system.
+
+It can read any image format supported by [STB Image](https://github.com/nothings/stb/blob/master/stb_image.h), and encode it to the following formats:
+
+* `r8g8b8a8_uint`
+* `r8g8b8a8_srgb`
+* `bc7_srgb_block`
+* `bc7_unorm_block`
+
+BC7 compression is achieved with [bc7enc_rdo](https://github.com/richgel999/bc7enc_rdo/). Bc7 encoding optionally supports a reduced entropy mode, and rate distortion optimization, both of which typically increase the effectiveness of lossless compression.
+
+Supports premultiplying alpha while encoding.
+
+Output files are stored as [KTX2](https://www.khronos.org/ktx/).
+
+### Library
+
+This package exports a Ktx2 library for loading KTX2 files in engine.
+
+## Viewing Textures
+
+Zex is not a texture viewer, and KTX2 files can't be opened in typical image editors. This is to be expected since textures store a lot of data normal image editors don't expect, in formats that don't make sense for normal interchange.
+
+I recommend [Tacent View](https://github.com/bluescan/tacentview) for inspecting textures.
+
+## Development Links
+
+* [KTX2 spec](https://registry.khronos.org/KTX/specs/2.0/ktxspec.v2.html#prohibitedFormats)
+* [Data Format Descriptor spec](https://registry.khronos.org/DataFormat/specs/1.3/dataformat.1.3.html)
+* [Reference KTX implementation and validator](https://github.com/KhronosGroup/KTX-Software)
+Output is tested with 
+
+## Zex is a work in progress
+
+Important features that are planned but not yet implemented. When I finish implementing these, I'll mark it as v1.0.0:
+* [ ] Supercompression
+	* The command line tool currently supports compressing the entire KTX2 file. This is an artifact from when Zex was a DDS tool. Instead, we should take advantage of KTX2's support for supercompression.
+* [ ] Automatic mipmap generation
+* [ ] Packing channels from separate images
+* [ ] Cubemap support
+* [ ] HDR support
+
+Possible features that need more thought:
+* [ ] Raw images with fewer than 4 channels
+* [ ] Other block based compression formats (e.g. for normal maps)
+
+Miscellaneous polish
+* [ ] Some upstream libraries fail safety checks in debug mode, we could investigate and upstream fixes
+* [ ] This library may make a good case for required subcommands in structopt
+* [ ] It's worth verifying the struct we use to pass arguments to the BC7 encoder is guaranteed to match the library's layout
