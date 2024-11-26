@@ -219,9 +219,15 @@ pub fn main() !void {
             .bc7, .r8g8b8a8 => .low,
             .r32g32b32a32 => .high,
         },
-    }) orelse {
-        log.err("{s}: decoding failed", .{args.positional.INPUT});
-        std.process.exit(1);
+    }) catch |err| switch (err) {
+        error.StbImageFailure => {
+            log.err("{s}: failed reading image", .{args.positional.INPUT});
+            std.process.exit(1);
+        },
+        error.LdrAsHdr => {
+            log.err("{s}: cannot store LDR input image as HDR format", .{args.positional.INPUT});
+            std.process.exit(1);
+        },
     };
     defer image.deinit();
 
@@ -635,6 +641,11 @@ pub const Image = struct {
     height: u32,
     data: []u8,
 
+    pub const Error = error{
+        StbImageFailure,
+        LdrAsHdr,
+    };
+
     pub const InitOptions = struct {
         pub const DynamicRange = enum {
             high,
@@ -646,7 +657,7 @@ pub const Image = struct {
         dynamic_range: DynamicRange,
         multiply_by_alpha: bool,
     };
-    pub fn init(options: InitOptions) ?@This() {
+    pub fn init(options: InitOptions) Error!@This() {
         switch (options.dynamic_range) {
             .low => {
                 var width: c_int = 0;
@@ -659,7 +670,7 @@ pub const Image = struct {
                     &height,
                     &input_channels,
                     options.desired_channels,
-                ) orelse return null;
+                ) orelse return error.StbImageFailure;
 
                 const len = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * @as(usize, @intCast(options.desired_channels));
                 const image: @This() = .{
@@ -681,6 +692,10 @@ pub const Image = struct {
                 return image;
             },
             .high => {
+                if (stbi_is_hdr_from_memory(options.bytes.ptr, @intCast(options.bytes.len)) == 0) {
+                    return error.LdrAsHdr;
+                }
+
                 var width: c_int = 0;
                 var height: c_int = 0;
                 var input_channels: c_int = 0;
@@ -691,7 +706,7 @@ pub const Image = struct {
                     &height,
                     &input_channels,
                     options.desired_channels,
-                ) orelse return null;
+                ) orelse return error.StbImageFailure;
 
                 const len = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * @as(usize, @intCast(options.desired_channels));
                 const data = data_ptr[0..len];
@@ -738,4 +753,6 @@ pub const Image = struct {
         channels_in_file: *c_int,
         desired_channels: c_int,
     ) callconv(.C) ?[*]f32;
+
+    extern fn stbi_is_hdr_from_memory(buffer: [*]const u8, len: c_int) callconv(.C) c_int;
 };
