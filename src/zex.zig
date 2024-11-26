@@ -43,10 +43,6 @@ const command: Command = .{
     .name = "zex",
     .description = "Converts images to KTX2.",
     .named_args = &.{
-        NamedArg.init(ColorSpace, .{
-            .long = "color-space",
-            .default = .{ .value = .srgb },
-        }),
         NamedArg.init(Alpha, .{
             .long = "alpha-input",
             .default = .{ .value = .straight },
@@ -69,22 +65,35 @@ const command: Command = .{
         }),
     },
     .subcommands = &.{
-        raw_command,
+        r8g8b8a8_command,
+        r32g32b32a32_command,
         bc7_command,
     },
 };
 
-const raw_command: Command = .{
-    .name = "raw",
-    .description = "Store the image raw.",
+const r8g8b8a8_command: Command = .{
+    .name = "r8g8b8a8",
+    .named_args = &.{
+        NamedArg.init(ColorSpace, .{
+            .long = "color-space",
+            .default = .{ .value = .srgb },
+        }),
+    },
+};
+
+const r32g32b32a32_command: Command = .{
+    .name = "r32g32b32a32",
 };
 
 const bc7_command: Command = .{
     .name = "bc7",
-    .description = "Encode as bc7.",
     .named_args = &.{
+        NamedArg.init(ColorSpace, .{
+            .long = "color-space",
+            .default = .{ .value = .srgb },
+        }),
         NamedArg.init(u8, .{
-            .description = "bc7 quality level, defaults to highest",
+            .description = "quality level, defaults to highest",
             .long = "uber",
             .default = .{ .value = Bc7Enc.Params.max_uber_level },
         }),
@@ -93,7 +102,7 @@ const bc7_command: Command = .{
             .default = .{ .value = false },
         }),
         NamedArg.init(u8, .{
-            .description = "bc7 partitions to scan in mode 1, defaults to highest",
+            .description = "partitions to scan in mode 1, defaults to highest",
             .long = "max-partitions-to-scan",
             .default = .{ .value = Bc7Enc.Params.max_partitions },
         }),
@@ -118,7 +127,7 @@ const rdo_command: Command = .{
     .description = "Use RDO to make the output more compressible.",
     .named_args = &.{
         NamedArg.init(f32, .{
-            .description = "bc7 rdo to apply",
+            .description = "rdo to apply",
             .long = "lambda",
             .default = .{ .value = 0.5 },
         }),
@@ -127,7 +136,7 @@ const rdo_command: Command = .{
             .default = .{ .value = null },
         }),
         NamedArg.init(?f32, .{
-            .description = "bc7 manually set smooth block error scale factor, higher values result in less distortion",
+            .description = "manually set smooth block error scale factor, higher values result in less distortion",
             .long = "smooth-block-error-scale",
             .default = .{ .value = 15.0 },
         }),
@@ -201,28 +210,26 @@ pub fn main() !void {
     };
     defer allocator.free(input_bytes);
 
-    const image = stbi.loadFromMemory(input_bytes, 4) orelse {
+    const image = Image.init(.{
+        .bytes = input_bytes,
+        .desired_channels = 4,
+        .multiply_by_alpha = args.named.@"alpha-input" == .straight and
+            args.named.@"alpha-output" == .premultiplied,
+        .dynamic_range = switch (encoding) {
+            .bc7, .r8g8b8a8 => .low,
+            .r32g32b32a32 => .high,
+        },
+    }) orelse {
         log.err("{s}: decoding failed", .{args.positional.INPUT});
         std.process.exit(1);
     };
-    defer stbi.free(image);
-
-    // Perform alpha conversions
-    if (args.named.@"alpha-output" == .premultiplied and args.named.@"alpha-input" == .straight) {
-        var px: usize = 0;
-        while (px < image.width * image.height * 4) : (px += 4) {
-            const a: f32 = @as(f32, @floatFromInt(image.data[px + 3])) / 255.0;
-            image.data[px + 0] = @intFromFloat(@as(f32, @floatFromInt(image.data[px + 0])) * a);
-            image.data[px + 1] = @intFromFloat(@as(f32, @floatFromInt(image.data[px + 1])) * a);
-            image.data[px + 2] = @intFromFloat(@as(f32, @floatFromInt(image.data[px + 2])) * a);
-        }
-    }
+    defer image.deinit();
 
     // Encode the pixel data
     const bc7_encoder = Bc7Enc.init() orelse @panic("failed to init encoder");
     defer bc7_encoder.deinit();
     const encoded = switch (encoding) {
-        .raw => image.data,
+        .r8g8b8a8, .r32g32b32a32 => image.data,
         .bc7 => |bc7| b: {
             var params: Bc7Enc.Params = .{};
 
@@ -240,7 +247,7 @@ pub fn main() !void {
             }
             params.max_partitions_to_scan = bc7.named.@"max-partitions-to-scan";
             // Ignored when using RDO, should be fine to set anyway
-            params.perceptual = args.named.@"color-space" == .srgb;
+            params.perceptual = bc7.named.@"color-space" == .srgb;
             params.mode6_only = bc7.named.@"mode-6-only";
 
             if (bc7.named.@"max-threads") |v| {
@@ -350,7 +357,7 @@ pub fn main() !void {
 
     // Write the header
     const samples: u8 = switch (encoding) {
-        .raw => 4,
+        .r8g8b8a8, .r32g32b32a32 => 4,
         .bc7 => 1,
     };
     const index = Ktx2.Header.Index.init(.{
@@ -359,16 +366,20 @@ pub fn main() !void {
     });
     writer.writeStruct(Ktx2.Header{
         .format = switch (encoding) {
-            .raw => switch (args.named.@"color-space") {
+            .r8g8b8a8 => |encoding_options| switch (encoding_options.named.@"color-space") {
                 .linear => .r8g8b8a8_uint,
                 .srgb => .r8g8b8a8_srgb,
             },
-            .bc7 => switch (args.named.@"color-space") {
+            .r32g32b32a32 => .r32g32b32a32_sfloat,
+            .bc7 => |encoding_options| switch (encoding_options.named.@"color-space") {
                 .linear => .bc7_unorm_block,
                 .srgb => .bc7_srgb_block,
             },
         },
-        .type_size = 1,
+        .type_size = switch (encoding) {
+            .r8g8b8a8, .bc7 => 1,
+            .r32g32b32a32 => 4,
+        },
         .pixel_width = image.width,
         .pixel_height = image.height,
         .pixel_depth = 0,
@@ -383,7 +394,8 @@ pub fn main() !void {
     };
 
     const level_alignment: u8 = if (args.named.zlib != null) 1 else switch (encoding) {
-        .raw => 1,
+        .r8g8b8a8 => 4,
+        .r32g32b32a32 => 16,
         .bc7 => 16,
     };
     const first_level_padding_offset = index.dfd_byte_offset + index.dfd_byte_length;
@@ -406,29 +418,33 @@ pub fn main() !void {
     writer.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock{
         .descriptor_block_size = Ktx2.BasicDescriptorBlock.descriptorBlockSize(samples),
         .model = switch (encoding) {
-            .raw => .rgbsda,
+            .r8g8b8a8, .r32g32b32a32 => .rgbsda,
             .bc7 => .bc7,
         },
         .primaries = .bt709,
-        .transfer = switch (args.named.@"color-space") {
-            .linear => .linear,
-            .srgb => .srgb,
+        .transfer = switch (encoding) {
+            .r32g32b32a32 => .linear,
+            inline else => |encoding_options| switch (encoding_options.named.@"color-space") {
+                .linear => .linear,
+                .srgb => .srgb,
+            },
         },
         .flags = .{
             .alpha_premultiplied = args.named.@"alpha-output" == .premultiplied,
         },
         .texel_block_dimension_0 = switch (encoding) {
-            .raw => .fromInt(1),
+            .r8g8b8a8, .r32g32b32a32 => .fromInt(1),
             .bc7 => .fromInt(4),
         },
         .texel_block_dimension_1 = switch (encoding) {
-            .raw => .fromInt(1),
+            .r8g8b8a8, .r32g32b32a32 => .fromInt(1),
             .bc7 => .fromInt(4),
         },
         .texel_block_dimension_2 = .fromInt(1),
         .texel_block_dimension_3 = .fromInt(1),
         .bytes_plane_0 = if (args.named.zlib != null) 0 else switch (encoding) {
-            .raw => 4,
+            .r8g8b8a8 => 4,
+            .r32g32b32a32 => 16,
             .bc7 => 16,
         },
         .bytes_plane_1 = 0,
@@ -443,14 +459,14 @@ pub fn main() !void {
         std.process.exit(1);
     };
     switch (encoding) {
-        .raw => for (0..4) |i| {
+        .r8g8b8a8 => |encoding_options| for (0..4) |i| {
             const ChannelType = Ktx2.BasicDescriptorBlock.Sample.ChannelType(.rgbsda);
             const channel_type: ChannelType = if (i == 3) .alpha else @enumFromInt(i);
             writer.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock.Sample{
                 .bit_offset = .fromInt(8 * @as(u16, @intCast(i))),
                 .bit_length = .fromInt(8),
                 .channel_type = @enumFromInt(@intFromEnum(channel_type)),
-                .linear = switch (args.named.@"color-space") {
+                .linear = switch (encoding_options.named.@"color-space") {
                     .linear => false,
                     .srgb => i == 3,
                 },
@@ -462,10 +478,29 @@ pub fn main() !void {
                 .sample_position_2 = 0,
                 .sample_position_3 = 0,
                 .lower = 0,
-                .upper = switch (args.named.@"color-space") {
+                .upper = switch (encoding_options.named.@"color-space") {
                     .linear => 1,
                     .srgb => 255,
                 },
+            })) catch unreachable;
+        },
+        .r32g32b32a32 => for (0..4) |i| {
+            const ChannelType = Ktx2.BasicDescriptorBlock.Sample.ChannelType(.rgbsda);
+            const channel_type: ChannelType = if (i == 3) .alpha else @enumFromInt(i);
+            writer.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock.Sample{
+                .bit_offset = .fromInt(32 * @as(u16, @intCast(i))),
+                .bit_length = .fromInt(32),
+                .channel_type = @enumFromInt(@intFromEnum(channel_type)),
+                .linear = false,
+                .exponent = false,
+                .signed = true,
+                .float = true,
+                .sample_position_0 = 0,
+                .sample_position_1 = 0,
+                .sample_position_2 = 0,
+                .sample_position_3 = 0,
+                .lower = @bitCast(@as(f32, -1.0)),
+                .upper = @bitCast(@as(f32, 1.0)),
             })) catch unreachable;
         },
         .bc7 => {
@@ -595,34 +630,94 @@ const Bc7Enc = opaque {
     extern fn bc7enc_getTotalBlocksSizeInBytes(self: *@This()) callconv(.C) u32;
 };
 
-const stbi = struct {
-    pub const Image = struct {
-        width: u32,
-        height: u32,
-        data: []u8,
-    };
+pub const Image = struct {
+    width: u32,
+    height: u32,
+    data: []u8,
 
-    pub fn loadFromMemory(raw: []const u8, desired_channels: c_int) ?Image {
-        var width: c_int = 0;
-        var height: c_int = 0;
-        var input_channels: c_int = 0;
-        const data = stbi_load_from_memory(
-            raw.ptr,
-            @intCast(raw.len),
-            &width,
-            &height,
-            &input_channels,
-            desired_channels,
-        ) orelse return null;
-        return .{
-            .width = @intCast(width),
-            .height = @intCast(height),
-            .data = data[0 .. @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * @as(usize, @intCast(desired_channels))],
+    pub const InitOptions = struct {
+        pub const DynamicRange = enum {
+            high,
+            low,
         };
+
+        bytes: []const u8,
+        desired_channels: u8,
+        dynamic_range: DynamicRange,
+        multiply_by_alpha: bool,
+    };
+    pub fn init(options: InitOptions) ?@This() {
+        switch (options.dynamic_range) {
+            .low => {
+                var width: c_int = 0;
+                var height: c_int = 0;
+                var input_channels: c_int = 0;
+                const data = stbi_load_from_memory(
+                    options.bytes.ptr,
+                    @intCast(options.bytes.len),
+                    &width,
+                    &height,
+                    &input_channels,
+                    options.desired_channels,
+                ) orelse return null;
+
+                const len = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * @as(usize, @intCast(options.desired_channels));
+                const image: @This() = .{
+                    .width = @intCast(width),
+                    .height = @intCast(height),
+                    .data = data[0..len],
+                };
+
+                if (options.multiply_by_alpha) {
+                    var px: usize = 0;
+                    while (px < image.width * image.height * 4) : (px += 4) {
+                        const a: f32 = @as(f32, @floatFromInt(image.data[px + 3])) / 255.0;
+                        image.data[px + 0] = @intFromFloat(@as(f32, @floatFromInt(image.data[px + 0])) * a);
+                        image.data[px + 1] = @intFromFloat(@as(f32, @floatFromInt(image.data[px + 1])) * a);
+                        image.data[px + 2] = @intFromFloat(@as(f32, @floatFromInt(image.data[px + 2])) * a);
+                    }
+                }
+
+                return image;
+            },
+            .high => {
+                var width: c_int = 0;
+                var height: c_int = 0;
+                var input_channels: c_int = 0;
+                const data_ptr = stbi_loadf_from_memory(
+                    options.bytes.ptr,
+                    @intCast(options.bytes.len),
+                    &width,
+                    &height,
+                    &input_channels,
+                    options.desired_channels,
+                ) orelse return null;
+
+                const len = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * @as(usize, @intCast(options.desired_channels));
+                const data = data_ptr[0..len];
+                const image: @This() = .{
+                    .width = @intCast(width),
+                    .height = @intCast(height),
+                    .data = std.mem.sliceAsBytes(data),
+                };
+
+                if (options.multiply_by_alpha) {
+                    var px: usize = 0;
+                    while (px < image.width * image.height * 4) : (px += 4) {
+                        const a = data[px + 3];
+                        data[px + 0] = data[px + 0] * a;
+                        data[px + 1] = data[px + 1] * a;
+                        data[px + 2] = data[px + 2] * a;
+                    }
+                }
+
+                return image;
+            },
+        }
     }
 
-    pub fn free(image: Image) void {
-        stbi_image_free(image.data.ptr);
+    pub fn deinit(self: @This()) void {
+        stbi_image_free(self.data.ptr);
     }
 
     extern fn stbi_load_from_memory(
@@ -634,4 +729,13 @@ const stbi = struct {
         desired_channels: c_int,
     ) callconv(.C) ?[*]u8;
     extern fn stbi_image_free(image: [*]u8) callconv(.C) void;
+
+    extern fn stbi_loadf_from_memory(
+        buffer: [*]const u8,
+        len: c_int,
+        x: *c_int,
+        y: *c_int,
+        channels_in_file: *c_int,
+        desired_channels: c_int,
+    ) callconv(.C) ?[*]f32;
 };
