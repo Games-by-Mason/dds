@@ -63,19 +63,32 @@ const command: Command = .{
             .long = "generate-mipmaps",
             .default = .{ .value = false },
         }),
-        NamedArg.init(?u5, .{
-            .description = "the max mip level to generate when --generate-mipmaps is set",
-            .long = "generate-mipmaps-max-level",
+        NamedArg.init(Image.Filter, .{
+            .long = "filter",
+            .default = .{ .value = .mitchell },
+        }),
+        NamedArg.init(?Image.Filter, .{
+            .description = "overrides --filter in the U direction",
+            .long = "filter-u",
             .default = .{ .value = null },
         }),
         NamedArg.init(?Image.Filter, .{
-            .description = "the filter to use for mipmap generation when --generate-mipmaps is set",
-            .long = "generate-mipmaps-filter",
+            .description = "overrides --filter in the V direction",
+            .long = "filter-v",
             .default = .{ .value = null },
         }),
         NamedArg.init(?Image.AddressMode, .{
-            .description = "the address mode use for mipmap generation when --generate-mipmaps is set",
-            .long = "generate-mipmaps-address-mode",
+            .long = "address-mode",
+            .default = .{ .value = null },
+        }),
+        NamedArg.init(?Image.AddressMode, .{
+            .description = "overrides --address-mode in the U direction",
+            .long = "address-mode-u",
+            .default = .{ .value = null },
+        }),
+        NamedArg.init(?Image.AddressMode, .{
+            .description = "overrides --address-mode in the V direction",
+            .long = "address-mode-v",
             .default = .{ .value = null },
         }),
     },
@@ -219,6 +232,21 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
+    const maybe_address_mode_u = args.named.@"address-mode-u" orelse args.named.@"address-mode";
+    const maybe_address_mode_v = args.named.@"address-mode-v" orelse args.named.@"address-mode";
+    const filter_u = args.named.@"filter-u" orelse args.named.filter;
+    const filter_v = args.named.@"filter-v" orelse args.named.filter;
+    if (filter_u == .box and maybe_address_mode_u != null and maybe_address_mode_u != .clamp) {
+        // Not supported by current STB, has no effect if set
+        log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
+        std.process.exit(1);
+    }
+    if (filter_v == .box and maybe_address_mode_v != null and maybe_address_mode_v != .clamp) {
+        // Not supported by current STB, has no effect if set
+        log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
+        std.process.exit(1);
+    }
+
     const cwd = std.fs.cwd();
 
     // Load the first level
@@ -264,30 +292,31 @@ pub fn main() !void {
 
     // Generate mipmaps for the other levels if requested
     if (args.named.@"generate-mipmaps") {
+        const address_mode_u = maybe_address_mode_u orelse {
+            log.err("{s}: address-mode not set", .{args.positional.INPUT});
+            std.process.exit(1);
+        };
+        const address_mode_v = maybe_address_mode_v orelse {
+            log.err("{s}: address-mode not set", .{args.positional.INPUT});
+            std.process.exit(1);
+        };
+
         const block_size: u8 = switch (encoding) {
             .@"rgba-u8", .@"rgba-f32" => 1,
             // We're allowed to go smaller than the block size, but there's no benefit to doing
             // so
             .bc7 => 4,
         };
-        const address_mode = args.named.@"generate-mipmaps-address-mode" orelse {
-            log.err("{s}: generate-mipmaps-address-mode not set", .{args.positional.INPUT});
-            std.process.exit(1);
-        };
-        const filter = args.named.@"generate-mipmaps-filter" orelse {
-            log.err("{s}: generate-mipmaps-filter not set", .{args.positional.INPUT});
-            std.process.exit(1);
-        };
+
         var image = raw_levels.get(0);
         while (image.width > block_size or image.height > block_size) {
-            if (args.named.@"generate-mipmaps-max-level") |max_level| {
-                if (raw_levels.len > max_level) break;
-            }
             image = image.resize(.{
                 .width = @max(1, image.width / 2),
                 .height = @max(1, image.height / 2),
-                .address_mode = address_mode,
-                .filter = filter,
+                .address_mode_u = address_mode_u,
+                .address_mode_v = address_mode_v,
+                .filter_u = filter_u,
+                .filter_v = filter_v,
             }) orelse {
                 log.err("{s}: mipmap generation failed", .{args.positional.INPUT});
                 std.process.exit(1);
@@ -774,6 +803,8 @@ pub const Image = struct {
     };
 
     pub const DataType = StbirDataType;
+    pub const AddressMode = StbirEdge;
+    pub const Filter = StbirFilter;
 
     pub const Error = error{
         StbImageFailure,
@@ -872,36 +903,54 @@ pub const Image = struct {
     pub const ResizeOptions = struct {
         width: u32,
         height: u32,
-        address_mode: AddressMode,
-        filter: Filter,
+        address_mode_u: AddressMode,
+        address_mode_v: AddressMode,
+        filter_u: Filter,
+        filter_v: Filter,
     };
 
     pub fn resize(self: @This(), options: ResizeOptions) ?Image {
-        const pixel_bytes = self.ty.bytesPerChannel() * @intFromEnum(self.channels);
-        const data = stbir_resize(
+        if (options.width == 0 or options.height == 0) return null;
+
+        const input_stride = self.width * self.ty.bytesPerChannel() * @intFromEnum(self.channels);
+        const output_stride = options.width * self.ty.bytesPerChannel() * @intFromEnum(self.channels);
+        const output_size = options.height * output_stride;
+        const data: [*]u8 = @ptrCast(std.c.malloc(output_size) orelse return null);
+
+        var stbr_options: StbirResize = undefined;
+        stbir_resize_init(
+            &stbr_options,
             self.data.ptr,
             @intCast(self.width),
             @intCast(self.height),
-            @intCast(self.width * pixel_bytes),
-            null,
+            @intCast(input_stride),
+            data,
             @intCast(options.width),
             @intCast(options.height),
-            @intCast(options.width * pixel_bytes),
+            @intCast(output_stride),
             .fromChannels(self.channels),
             self.ty,
-            options.address_mode,
-            options.filter,
-        ) orelse return null;
+        );
+
+        stbr_options.horizontal_edge = options.address_mode_u;
+        stbr_options.vertical_edge = options.address_mode_v;
+        stbr_options.horizontal_filter = options.filter_u;
+        stbr_options.vertical_filter = options.filter_v;
+
+        if (stbir_resize_extended(&stbr_options) != 1) {
+            std.c.free(data);
+            return null;
+        }
+
         return .{
             .width = options.width,
             .height = options.height,
             .channels = self.channels,
             .ty = self.ty,
-            .data = data[0..(options.width * options.height * pixel_bytes)],
+            .data = data[0..output_size],
         };
     }
 
-    // STB Image
     extern fn stbi_load_from_memory(
         buffer: [*]const u8,
         len: c_int,
@@ -923,23 +972,24 @@ pub const Image = struct {
 
     extern fn stbi_is_hdr_from_memory(buffer: [*]const u8, len: c_int) callconv(.C) c_int;
 
-    // STB Resize 2
-    pub const AddressMode = enum(c_uint) {
+    pub const StbirEdge = enum(c_uint) {
         clamp = 0,
         reflect = 1,
         wrap = 2,
         zero = 3,
     };
 
-    pub const Filter = enum(c_uint) {
-        default = 0,
+    pub const StbirFilter = enum(c_uint) {
+        // We don't support the default filter enum
+        // default = 0,
         box = 1,
         triangle = 2,
-        cubic_b_spline = 3,
-        catmull_rom = 4,
+        @"cubic-b-spline" = 3,
+        @"catmull-rom" = 4,
         mitchell = 5,
-        point_sample = 6,
-        other = 7,
+        @"point-sample" = 6,
+        // We don't support custom filters
+        // other = 7,
     };
 
     const StbirDataType = enum(c_uint) {
@@ -1004,4 +1054,73 @@ pub const Image = struct {
         address_mode: AddressMode,
         filter: Filter,
     ) callconv(.C) ?[*]u8;
+
+    const StbirInputCallback = fn (
+        optional_output: *anyopaque,
+        input_ptr: *const anyopaque,
+        num_pixels: c_int,
+        x: c_int,
+        y: c_int,
+        context: *anyopaque,
+    ) callconv(.C) *const anyopaque;
+    const StbirOutputCallback = fn (
+        output_ptr: *const anyopaque,
+        num_pixels: c_int,
+        y: c_int,
+        context: *anyopaque,
+    ) callconv(.C) void;
+    const StbirKernelCallback = fn (x: f32, scale: f32, user_data: *anyopaque) callconv(.C) f32;
+    const StbirSupportCallback = fn (scale: f32, user_data: *anyopaque) callconv(.C) f32;
+    const StbirResize = extern struct {
+        user_data: *anyopaque,
+        input_pixels: [*]const u8,
+        input_w: c_int,
+        input_h: c_int,
+        input_s0: f64,
+        input_t0: f64,
+        input_s1: f64,
+        input_t1: f64,
+        input_cb: *const StbirInputCallback,
+        output_pixels: [*]u8,
+        output_w: c_int,
+        output_h: c_int,
+        output_subx: c_int,
+        output_suby: c_int,
+        output_subw: c_int,
+        output_subh: c_int,
+        output_cb: *const StbirOutputCallback,
+        input_stride_in_bytes: c_int,
+        output_stride_in_bytes: c_int,
+        splits: c_int,
+        fast_alpha: c_int,
+        needs_rebuild: c_int,
+        called_alloc: c_int,
+        input_pixel_layout_public: StbirPixelLayout,
+        output_pixel_layout_public: StbirPixelLayout,
+        input_data_type: StbirDataType,
+        output_data_type: StbirDataType,
+        horizontal_filter: StbirFilter,
+        vertical_filter: StbirFilter,
+        horizontal_edge: StbirEdge,
+        vertical_edge: StbirEdge,
+        horizontal_filter_kernel: *const StbirKernelCallback,
+        horizontal_filter_support: *const StbirSupportCallback,
+        vertical_filter_kernel: *const StbirKernelCallback,
+        vertical_filter_support: *const StbirSupportCallback,
+        samplers: *anyopaque,
+    };
+    extern fn stbir_resize_init(
+        resize: *StbirResize,
+        input_pixels: [*]const u8,
+        input_w: c_int,
+        input_h: c_int,
+        input_stride_in_bytes: c_int,
+        output_pixels: *anyopaque,
+        output_w: c_int,
+        output_h: c_int,
+        output_stride_in_bytes: c_int,
+        pixel_layout: StbirPixelLayout,
+        data_type: StbirDataType,
+    ) callconv(.C) void;
+    extern fn stbir_resize_extended(resize: *StbirResize) callconv(.C) c_int;
 };
