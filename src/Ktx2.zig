@@ -291,7 +291,7 @@ pub const Header = extern struct {
 
     pub const Index = extern struct {
         pub const InitOptions = struct {
-            levels: u5,
+            levels: u8,
             samples: u8,
         };
 
@@ -331,6 +331,9 @@ pub const identifier = .{
     '\x1A',
     '\n',
 };
+
+/// The max levels possible in a valid KTX file.
+pub const max_levels = 31;
 
 pub const Level = extern struct {
     byte_offset: u64,
@@ -719,12 +722,12 @@ pub fn init(bytes: []const u8) Error!@This() {
     }
 
     // Check that we don't have too many levels
-    const max_levels = std.math.log2_int(u32, @max(
+    const max_levels_for_size = std.math.log2_int(u32, @max(
         header.pixel_width,
         header.pixel_height,
         header.pixel_depth,
     ));
-    if (header.level_count.toInt() > max_levels) {
+    if (header.level_count.toInt() > max_levels_for_size) {
         return error.InvalidKtx2;
     }
 

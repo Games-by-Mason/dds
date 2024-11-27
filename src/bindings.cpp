@@ -5,6 +5,13 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#define STBIR_SSE2
+#define STBIR_AVX
+#define STBIR_AVX2
+#define STBIR_USE_FMA
+#include "stb_image_resize2.h"
+
 extern "C" {
 	rdo_bc::rdo_bc_encoder * bc7enc_init() {
 		return new rdo_bc::rdo_bc_encoder();

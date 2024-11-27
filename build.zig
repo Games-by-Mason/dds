@@ -43,7 +43,27 @@ pub fn build(b: *std.Build) void {
                     },
                 });
                 libbc7enc.linkLibCpp();
+                libbc7enc.addIncludePath(bc7enc.path("."));
                 libbc7enc.installHeadersDirectory(bc7enc.path("."), "bc7enc", .{});
+
+                // Build the C++ bindings
+                const bindings = b.addStaticLibrary(.{
+                    .name = "bindings",
+                    .target = target,
+                    // Doesn't currently pass safety checks
+                    .optimize = switch (optimize) {
+                        .ReleaseSmall => .ReleaseSmall,
+                        else => .ReleaseFast,
+                    },
+                });
+                bindings.addIncludePath(stb.path(""));
+                bindings.addCSourceFiles(.{
+                    .root = b.path("src"),
+                    .files = &.{
+                        "bindings.cpp",
+                    },
+                });
+                bindings.linkLibrary(libbc7enc);
 
                 // Build the executable
                 const exe = b.addExecutable(.{
@@ -53,10 +73,7 @@ pub fn build(b: *std.Build) void {
                     .optimize = optimize,
                 });
                 exe.root_module.addImport("Ktx2", lib);
-                exe.linkLibrary(libbc7enc);
-                exe.addCSourceFile(.{ .file = b.path("src/bindings.cpp") });
-                exe.addIncludePath(b.path("src"));
-                exe.addIncludePath(stb.path(""));
+                exe.linkLibrary(bindings);
                 exe.root_module.addImport("structopt", structopt.module("structopt"));
                 b.installArtifact(exe);
 

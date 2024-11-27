@@ -20,7 +20,7 @@ While convenient, these formats do not provide compression ratios competitive wi
 
 This high level strategy is effective, but it's hard to come by tools that make employing it easy, so it's typical for small games to either reinvent the wheel, or miss out on the benefits of these formats entirely. This library aims to fill that gap.
 
-In particular, Zig is uniquely suited to make this process easy via its build system which can be extended with tools like Zex to compress textures at build time, relying on the build system for caching and parallelization.
+In particular, Zig is uniquely suited to make this process easy via its build system which can be extended with tools like Zex to compress textures at build time, automatically providing caching and parallelism.
 
 ## What's Provided
 
@@ -32,6 +32,7 @@ It can read any image format supported by [STB Image](https://github.com/nothing
 
 * `r8g8b8a8_uint`
 * `r8g8b8a8_srgb`
+* `r32g32b32a32_sfloat`
 * `bc7_srgb_block`
 * `bc7_unorm_block`
 
