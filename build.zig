@@ -63,6 +63,7 @@ pub fn build(b: *std.Build) void {
                         "bindings.cpp",
                     },
                 });
+                bindings.installHeadersDirectory(stb.path("."), "", .{});
                 bindings.linkLibrary(libbc7enc);
 
                 // Build the executable

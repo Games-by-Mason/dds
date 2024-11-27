@@ -9,6 +9,11 @@ const NamedArg = structopt.NamedArg;
 const PositionalArg = structopt.PositionalArg;
 const log = std.log;
 
+const c = @cImport({
+    @cInclude("stb_image.h");
+    @cInclude("stb_image_resize2.h");
+});
+
 const max_file_len = 4294967296;
 
 const ColorSpace = enum {
@@ -864,9 +869,38 @@ pub const Image = struct {
         @"4" = 4,
     };
 
-    pub const DataType = StbirDataType;
-    pub const AddressMode = StbirEdge;
-    pub const Filter = StbirFilter;
+    pub const DataType = enum(c_uint) {
+        u8 = c.STBIR_TYPE_UINT8,
+        u8_srgb = c.STBIR_TYPE_UINT8_SRGB,
+        // "alpha channel, when present, should also be SRGB (this is very unusual)"
+        u8_srgb_alpha = c.STBIR_TYPE_UINT8_SRGB_ALPHA,
+        u16 = c.STBIR_TYPE_UINT16,
+        f32 = c.STBIR_TYPE_FLOAT,
+        f16 = c.STBIR_TYPE_HALF_FLOAT,
+
+        pub fn bytesPerChannel(self: @This()) u8 {
+            return switch (self) {
+                .u8, .u8_srgb, .u8_srgb_alpha => 1,
+                .u16 => 2,
+                .f32 => 4,
+                .f16 => 2,
+            };
+        }
+    };
+    pub const AddressMode = enum(c_uint) {
+        clamp = c.STBIR_EDGE_CLAMP,
+        reflect = c.STBIR_EDGE_REFLECT,
+        wrap = c.STBIR_EDGE_WRAP,
+        zero = c.STBIR_EDGE_ZERO,
+    };
+    pub const Filter = enum(c_uint) {
+        box = c.STBIR_FILTER_BOX,
+        triangle = c.STBIR_FILTER_TRIANGLE,
+        @"cubic-b-spline" = c.STBIR_FILTER_CUBICBSPLINE,
+        @"catmull-rom" = c.STBIR_FILTER_CATMULLROM,
+        mitchell = c.STBIR_FILTER_MITCHELL,
+        @"point-sample" = c.STBIR_FILTER_POINT_SAMPLE,
+    };
 
     pub const Error = error{
         StbImageFailure,
@@ -885,7 +919,7 @@ pub const Image = struct {
                 var width: c_int = 0;
                 var height: c_int = 0;
                 var input_channels: c_int = 0;
-                const data = stbi_load_from_memory(
+                const data = c.stbi_load_from_memory(
                     options.bytes.ptr,
                     @intCast(options.bytes.len),
                     &width,
@@ -916,14 +950,14 @@ pub const Image = struct {
                 return image;
             },
             .f32 => {
-                if (stbi_is_hdr_from_memory(options.bytes.ptr, @intCast(options.bytes.len)) == 0) {
+                if (c.stbi_is_hdr_from_memory(options.bytes.ptr, @intCast(options.bytes.len)) == 0) {
                     return error.LdrAsHdr;
                 }
 
                 var width: c_int = 0;
                 var height: c_int = 0;
                 var input_channels: c_int = 0;
-                const data_ptr = stbi_loadf_from_memory(
+                const data_ptr = c.stbi_loadf_from_memory(
                     options.bytes.ptr,
                     @intCast(options.bytes.len),
                     &width,
@@ -959,7 +993,7 @@ pub const Image = struct {
     }
 
     pub fn deinit(self: @This()) void {
-        stbi_image_free(self.data.ptr);
+        c.stbi_image_free(self.data.ptr);
     }
 
     pub const ResizeOptions = struct {
@@ -979,8 +1013,8 @@ pub const Image = struct {
         const output_size = options.height * output_stride;
         const data: [*]u8 = @ptrCast(std.c.malloc(output_size) orelse return null);
 
-        var stbr_options: StbirResize = undefined;
-        stbir_resize_init(
+        var stbr_options: c.STBIR_RESIZE = undefined;
+        c.stbir_resize_init(
             &stbr_options,
             self.data.ptr,
             @intCast(self.width),
@@ -990,16 +1024,22 @@ pub const Image = struct {
             @intCast(options.width),
             @intCast(options.height),
             @intCast(output_stride),
-            .fromChannels(self.channels),
-            self.ty,
+            switch (self.channels) {
+                .@"1" => c.STBIR_1CHANNEL,
+                .@"2" => c.STBIR_2CHANNEL,
+                .@"3" => c.STBIR_RGB,
+                // We always premultiply alpha channels ourselves if they represent transparency
+                .@"4" => c.STBIR_RGBA_PM,
+            },
+            @intFromEnum(self.ty),
         );
 
-        stbr_options.horizontal_edge = options.address_mode_u;
-        stbr_options.vertical_edge = options.address_mode_v;
-        stbr_options.horizontal_filter = options.filter_u;
-        stbr_options.vertical_filter = options.filter_v;
+        stbr_options.horizontal_edge = @intFromEnum(options.address_mode_u);
+        stbr_options.vertical_edge = @intFromEnum(options.address_mode_v);
+        stbr_options.horizontal_filter = @intFromEnum(options.filter_u);
+        stbr_options.vertical_filter = @intFromEnum(options.filter_v);
 
-        if (stbir_resize_extended(&stbr_options) != 1) {
+        if (c.stbir_resize_extended(&stbr_options) != 1) {
             std.c.free(data);
             return null;
         }
@@ -1012,177 +1052,4 @@ pub const Image = struct {
             .data = data[0..output_size],
         };
     }
-
-    extern fn stbi_load_from_memory(
-        buffer: [*]const u8,
-        len: c_int,
-        x: *c_int,
-        y: *c_int,
-        channels_in_file: *c_int,
-        desired_channels: c_int,
-    ) callconv(.C) ?[*]u8;
-    extern fn stbi_image_free(image: [*]u8) callconv(.C) void;
-
-    extern fn stbi_loadf_from_memory(
-        buffer: [*]const u8,
-        len: c_int,
-        x: *c_int,
-        y: *c_int,
-        channels_in_file: *c_int,
-        desired_channels: c_int,
-    ) callconv(.C) ?[*]f32;
-
-    extern fn stbi_is_hdr_from_memory(buffer: [*]const u8, len: c_int) callconv(.C) c_int;
-
-    pub const StbirEdge = enum(c_uint) {
-        clamp = 0,
-        reflect = 1,
-        wrap = 2,
-        zero = 3,
-    };
-
-    pub const StbirFilter = enum(c_uint) {
-        // We don't support the default filter enum
-        // default = 0,
-        box = 1,
-        triangle = 2,
-        @"cubic-b-spline" = 3,
-        @"catmull-rom" = 4,
-        mitchell = 5,
-        @"point-sample" = 6,
-        // We don't support custom filters
-        // other = 7,
-    };
-
-    const StbirDataType = enum(c_uint) {
-        u8 = 0,
-        u8_srgb = 1,
-        // "alpha channel, when present, should also be SRGB (this is very unusual)"
-        u8_srgb_alpha = 2,
-        u16 = 3,
-        f32 = 4,
-        f16 = 5,
-
-        pub fn bytesPerChannel(self: @This()) u8 {
-            return switch (self) {
-                .u8, .u8_srgb, .u8_srgb_alpha => 1,
-                .u16 => 2,
-                .f32 => 4,
-                .f16 => 2,
-            };
-        }
-    };
-
-    const StbirPixelLayout = enum(c_uint) {
-        @"1_channel" = 1,
-        @"2_channel" = 2,
-        rgb = 3,
-        bgr = 0,
-        @"4_channel" = 5,
-        rgba = 4,
-        bgra = 6,
-        argb = 7,
-        abgr = 8,
-        ra = 9,
-        ar = 10,
-        rgba_pm = 11,
-        bgra_pm = 12,
-        argb_pm = 13,
-        abgr_pm = 14,
-        ra_pm = 15,
-        ar_pm = 16,
-
-        fn fromChannels(channels: Channels) @This() {
-            return switch (channels) {
-                .@"1" => .@"1_channel",
-                .@"2" => .@"2_channel",
-                .@"3" => .rgb,
-                .@"4" => .rgba_pm, // We always premultiply alpha channels ourselves
-            };
-        }
-    };
-
-    extern fn stbir_resize(
-        input_pixels: *const anyopaque,
-        input_w: c_int,
-        input_h: c_int,
-        input_stride_in_bytes: c_int,
-        output_pixels: ?*anyopaque,
-        output_w: c_int,
-        output_h: c_int,
-        output_stride_in_bytes: c_int,
-        pixel_layout: StbirPixelLayout,
-        data_type: DataType,
-        address_mode: AddressMode,
-        filter: Filter,
-    ) callconv(.C) ?[*]u8;
-
-    const StbirInputCallback = fn (
-        optional_output: *anyopaque,
-        input_ptr: *const anyopaque,
-        num_pixels: c_int,
-        x: c_int,
-        y: c_int,
-        context: *anyopaque,
-    ) callconv(.C) *const anyopaque;
-    const StbirOutputCallback = fn (
-        output_ptr: *const anyopaque,
-        num_pixels: c_int,
-        y: c_int,
-        context: *anyopaque,
-    ) callconv(.C) void;
-    const StbirKernelCallback = fn (x: f32, scale: f32, user_data: *anyopaque) callconv(.C) f32;
-    const StbirSupportCallback = fn (scale: f32, user_data: *anyopaque) callconv(.C) f32;
-    const StbirResize = extern struct {
-        user_data: *anyopaque,
-        input_pixels: [*]const u8,
-        input_w: c_int,
-        input_h: c_int,
-        input_s0: f64,
-        input_t0: f64,
-        input_s1: f64,
-        input_t1: f64,
-        input_cb: *const StbirInputCallback,
-        output_pixels: [*]u8,
-        output_w: c_int,
-        output_h: c_int,
-        output_subx: c_int,
-        output_suby: c_int,
-        output_subw: c_int,
-        output_subh: c_int,
-        output_cb: *const StbirOutputCallback,
-        input_stride_in_bytes: c_int,
-        output_stride_in_bytes: c_int,
-        splits: c_int,
-        fast_alpha: c_int,
-        needs_rebuild: c_int,
-        called_alloc: c_int,
-        input_pixel_layout_public: StbirPixelLayout,
-        output_pixel_layout_public: StbirPixelLayout,
-        input_data_type: StbirDataType,
-        output_data_type: StbirDataType,
-        horizontal_filter: StbirFilter,
-        vertical_filter: StbirFilter,
-        horizontal_edge: StbirEdge,
-        vertical_edge: StbirEdge,
-        horizontal_filter_kernel: *const StbirKernelCallback,
-        horizontal_filter_support: *const StbirSupportCallback,
-        vertical_filter_kernel: *const StbirKernelCallback,
-        vertical_filter_support: *const StbirSupportCallback,
-        samplers: *anyopaque,
-    };
-    extern fn stbir_resize_init(
-        resize: *StbirResize,
-        input_pixels: [*]const u8,
-        input_w: c_int,
-        input_h: c_int,
-        input_stride_in_bytes: c_int,
-        output_pixels: *anyopaque,
-        output_w: c_int,
-        output_h: c_int,
-        output_stride_in_bytes: c_int,
-        pixel_layout: StbirPixelLayout,
-        data_type: StbirDataType,
-    ) callconv(.C) void;
-    extern fn stbir_resize_extended(resize: *StbirResize) callconv(.C) c_int;
 };
