@@ -44,20 +44,39 @@ const command: Command = .{
     .description = "Converts images to KTX2.",
     .named_args = &.{
         NamedArg.init(Alpha, .{
+            .description = "whether or not the input is already premultiplied",
             .long = "alpha-input",
             .default = .{ .value = .straight },
         }),
         NamedArg.init(Alpha, .{
+            .description = "must be set if the alpha channel is transparency",
             .long = "alpha-output",
             .default = .{ .value = .premultiplied },
         }),
         NamedArg.init(?ZlibLevel, .{
+            .description = "supercompress the data at the given level with zlib",
             .long = "zlib",
             .default = .{ .value = null },
         }),
         NamedArg.init(bool, .{
+            .description = "automatically generate mipmaps",
             .long = "generate-mipmaps",
             .default = .{ .value = false },
+        }),
+        NamedArg.init(?u5, .{
+            .description = "the max mip level to generate when --generate-mipmaps is set",
+            .long = "generate-mipmaps-max-level",
+            .default = .{ .value = null },
+        }),
+        NamedArg.init(?Image.Filter, .{
+            .description = "the filter to use for mipmap generation when --generate-mipmaps is set",
+            .long = "generate-mipmaps-filter",
+            .default = .{ .value = null },
+        }),
+        NamedArg.init(?Image.AddressMode, .{
+            .description = "the address mode use for mipmap generation when --generate-mipmaps is set",
+            .long = "generate-mipmaps-address-mode",
+            .default = .{ .value = null },
         }),
     },
     .positional_args = &.{
@@ -69,14 +88,14 @@ const command: Command = .{
         }),
     },
     .subcommands = &.{
-        r8g8b8a8_command,
-        r32g32b32a32_command,
+        rgba_u8_command,
+        rgba_f32_command,
         bc7_command,
     },
 };
 
-const r8g8b8a8_command: Command = .{
-    .name = "r8g8b8a8",
+const rgba_u8_command: Command = .{
+    .name = "rgba-u8",
     .named_args = &.{
         NamedArg.init(ColorSpace, .{
             .long = "color-space",
@@ -85,8 +104,8 @@ const r8g8b8a8_command: Command = .{
     },
 };
 
-const r32g32b32a32_command: Command = .{
-    .name = "r32g32b32a32",
+const rgba_f32_command: Command = .{
+    .name = "rgba-f32",
 };
 
 const bc7_command: Command = .{
@@ -102,6 +121,7 @@ const bc7_command: Command = .{
             .default = .{ .value = Bc7Enc.Params.max_uber_level },
         }),
         NamedArg.init(bool, .{
+            .description = "reduce entropy for better supercompression",
             .long = "reduce-entropy",
             .default = .{ .value = false },
         }),
@@ -128,7 +148,7 @@ const bc7_command: Command = .{
 
 const rdo_command: Command = .{
     .name = "rdo",
-    .description = "Use RDO to make the output more compressible.",
+    .description = "use RDO for better supercompression",
     .named_args = &.{
         NamedArg.init(f32, .{
             .description = "rdo to apply",
@@ -225,11 +245,11 @@ pub fn main() !void {
         .channels = .@"4",
         .premultiply = premultiply,
         .ty = switch (encoding) {
-            inline .bc7, .r8g8b8a8 => |ec| switch (ec.named.@"color-space") {
+            inline .bc7, .@"rgba-u8" => |ec| switch (ec.named.@"color-space") {
                 .srgb => .u8_srgb,
                 .linear => .u8,
             },
-            .r32g32b32a32 => .f32,
+            .@"rgba-f32" => .f32,
         },
     }) catch |err| switch (err) {
         error.StbImageFailure => {
@@ -243,20 +263,31 @@ pub fn main() !void {
     });
 
     // Generate mipmaps for the other levels if requested
-    {
+    if (args.named.@"generate-mipmaps") {
         const block_size: u8 = switch (encoding) {
-            .r8g8b8a8, .r32g32b32a32 => 1,
+            .@"rgba-u8", .@"rgba-f32" => 1,
             // We're allowed to go smaller than the block size, but there's no benefit to doing
             // so
             .bc7 => 4,
         };
+        const address_mode = args.named.@"generate-mipmaps-address-mode" orelse {
+            log.err("{s}: generate-mipmaps-address-mode not set", .{args.positional.INPUT});
+            std.process.exit(1);
+        };
+        const filter = args.named.@"generate-mipmaps-filter" orelse {
+            log.err("{s}: generate-mipmaps-filter not set", .{args.positional.INPUT});
+            std.process.exit(1);
+        };
         var image = raw_levels.get(0);
         while (image.width > block_size or image.height > block_size) {
+            if (args.named.@"generate-mipmaps-max-level") |max_level| {
+                if (raw_levels.len > max_level) break;
+            }
             image = image.resize(.{
                 .width = @max(1, image.width / 2),
                 .height = @max(1, image.height / 2),
-                .address_mode = .clamp,
-                .filter = .box,
+                .address_mode = address_mode,
+                .filter = filter,
             }) orelse {
                 log.err("{s}: mipmap generation failed", .{args.positional.INPUT});
                 std.process.exit(1);
@@ -272,7 +303,7 @@ pub fn main() !void {
     };
     var encoded_levels: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
     switch (encoding) {
-        .r8g8b8a8, .r32g32b32a32 => for (raw_levels.constSlice()) |raw_level| {
+        .@"rgba-u8", .@"rgba-f32" => for (raw_levels.constSlice()) |raw_level| {
             encoded_levels.appendAssumeCapacity(raw_level.data);
         },
         .bc7 => |bc7| {
@@ -426,7 +457,7 @@ pub fn main() !void {
 
     // Write the header
     const samples: u8 = switch (encoding) {
-        .r8g8b8a8, .r32g32b32a32 => 4,
+        .@"rgba-u8", .@"rgba-f32" => 4,
         .bc7 => 1,
     };
     const index = Ktx2.Header.Index.init(.{
@@ -435,19 +466,19 @@ pub fn main() !void {
     });
     writer.writeStruct(Ktx2.Header{
         .format = switch (encoding) {
-            .r8g8b8a8 => |encoding_options| switch (encoding_options.named.@"color-space") {
+            .@"rgba-u8" => |encoding_options| switch (encoding_options.named.@"color-space") {
                 .linear => .r8g8b8a8_uint,
                 .srgb => .r8g8b8a8_srgb,
             },
-            .r32g32b32a32 => .r32g32b32a32_sfloat,
+            .@"rgba-f32" => .r32g32b32a32_sfloat,
             .bc7 => |encoding_options| switch (encoding_options.named.@"color-space") {
                 .linear => .bc7_unorm_block,
                 .srgb => .bc7_srgb_block,
             },
         },
         .type_size = switch (encoding) {
-            .r8g8b8a8, .bc7 => 1,
-            .r32g32b32a32 => 4,
+            .@"rgba-u8", .bc7 => 1,
+            .@"rgba-f32" => 4,
         },
         .pixel_width = raw_levels.get(0).width,
         .pixel_height = raw_levels.get(0).height,
@@ -463,8 +494,8 @@ pub fn main() !void {
     };
 
     const level_alignment: u8 = if (args.named.zlib != null) 1 else switch (encoding) {
-        .r8g8b8a8 => 4,
-        .r32g32b32a32 => 16,
+        .@"rgba-u8" => 4,
+        .@"rgba-f32" => 16,
         .bc7 => 16,
     };
     {
@@ -503,12 +534,12 @@ pub fn main() !void {
     writer.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock{
         .descriptor_block_size = Ktx2.BasicDescriptorBlock.descriptorBlockSize(samples),
         .model = switch (encoding) {
-            .r8g8b8a8, .r32g32b32a32 => .rgbsda,
+            .@"rgba-u8", .@"rgba-f32" => .rgbsda,
             .bc7 => .bc7,
         },
         .primaries = .bt709,
         .transfer = switch (encoding) {
-            .r32g32b32a32 => .linear,
+            .@"rgba-f32" => .linear,
             inline else => |encoding_options| switch (encoding_options.named.@"color-space") {
                 .linear => .linear,
                 .srgb => .srgb,
@@ -518,18 +549,18 @@ pub fn main() !void {
             .alpha_premultiplied = args.named.@"alpha-output" == .premultiplied,
         },
         .texel_block_dimension_0 = switch (encoding) {
-            .r8g8b8a8, .r32g32b32a32 => .fromInt(1),
+            .@"rgba-u8", .@"rgba-f32" => .fromInt(1),
             .bc7 => .fromInt(4),
         },
         .texel_block_dimension_1 = switch (encoding) {
-            .r8g8b8a8, .r32g32b32a32 => .fromInt(1),
+            .@"rgba-u8", .@"rgba-f32" => .fromInt(1),
             .bc7 => .fromInt(4),
         },
         .texel_block_dimension_2 = .fromInt(1),
         .texel_block_dimension_3 = .fromInt(1),
         .bytes_plane_0 = if (args.named.zlib != null) 0 else switch (encoding) {
-            .r8g8b8a8 => 4,
-            .r32g32b32a32 => 16,
+            .@"rgba-u8" => 4,
+            .@"rgba-f32" => 16,
             .bc7 => 16,
         },
         .bytes_plane_1 = 0,
@@ -544,7 +575,7 @@ pub fn main() !void {
         std.process.exit(1);
     };
     switch (encoding) {
-        .r8g8b8a8 => |encoding_options| for (0..4) |i| {
+        .@"rgba-u8" => |encoding_options| for (0..4) |i| {
             const ChannelType = Ktx2.BasicDescriptorBlock.Sample.ChannelType(.rgbsda);
             const channel_type: ChannelType = if (i == 3) .alpha else @enumFromInt(i);
             writer.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock.Sample{
@@ -569,7 +600,7 @@ pub fn main() !void {
                 },
             })) catch unreachable;
         },
-        .r32g32b32a32 => for (0..4) |i| {
+        .@"rgba-f32" => for (0..4) |i| {
             const ChannelType = Ktx2.BasicDescriptorBlock.Sample.ChannelType(.rgbsda);
             const channel_type: ChannelType = if (i == 3) .alpha else @enumFromInt(i);
             writer.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock.Sample{
