@@ -91,6 +91,21 @@ const command: Command = .{
             .long = "address-mode-v",
             .default = .{ .value = null },
         }),
+        NamedArg.init(?u32, .{
+            .description = "scale the largest dimension down to max size, preserves aspect ratio",
+            .long = "max-size",
+            .default = .{ .value = null },
+        }),
+        NamedArg.init(?u32, .{
+            .description = "overrides --max-size for the width, still preserves aspect ratio",
+            .long = "max-width",
+            .default = .{ .value = null },
+        }),
+        NamedArg.init(?u32, .{
+            .description = "overrides --max-size for the height, still preserves aspect ratio",
+            .long = "max-height",
+            .default = .{ .value = null },
+        }),
     },
     .positional_args = &.{
         PositionalArg.init([]const u8, .{
@@ -289,6 +304,53 @@ pub fn main() !void {
             std.process.exit(1);
         },
     });
+
+    // Scale the first level if requested
+    {
+        // Read the scale parameters
+        var image = raw_levels.get(0);
+        const maybe_max_width = args.named.@"max-width" orelse args.named.@"max-size";
+        const maybe_max_height = args.named.@"max-height" orelse args.named.@"max-size";
+
+        // Check if any scaling was requested
+        if (maybe_max_width != null or maybe_max_height != null) {
+            // If it was, validate the other input arguments, even if it turns out that the image
+            // is already small enough (an artist resizing an input image shouldn't cause a
+            // previously working bake step to start failing!)
+            const max_width = maybe_max_width orelse image.width;
+            const max_height = maybe_max_height orelse image.height;
+            const address_mode_u = maybe_address_mode_u orelse {
+                log.err("{s}: address-mode not set", .{args.positional.INPUT});
+                std.process.exit(1);
+            };
+            const address_mode_v = maybe_address_mode_v orelse {
+                log.err("{s}: address-mode not set", .{args.positional.INPUT});
+                std.process.exit(1);
+            };
+
+            // Perform the resize if one is necessary
+            if (max_width < image.width or max_height < image.height) {
+                const x_scale = @as(f64, @floatFromInt(max_width)) / @as(f64, @floatFromInt(image.width));
+                const y_scale = @as(f64, @floatFromInt(max_height)) / @as(f64, @floatFromInt(image.height));
+                const scale = @min(x_scale, y_scale);
+                const width = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(image.width)))), max_width);
+                const height = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(image.height)))), max_height);
+                const scaled = image.resize(.{
+                    .width = width,
+                    .height = height,
+                    .address_mode_u = address_mode_u,
+                    .address_mode_v = address_mode_v,
+                    .filter_u = filter_u,
+                    .filter_v = filter_v,
+                }) orelse {
+                    log.err("{s}: resize failed", .{args.positional.INPUT});
+                    std.process.exit(1);
+                };
+                raw_levels.pop().deinit();
+                raw_levels.appendAssumeCapacity(scaled);
+            }
+        }
+    }
 
     // Generate mipmaps for the other levels if requested
     if (args.named.@"generate-mipmaps") {
