@@ -68,9 +68,10 @@ const command: Command = .{
             .long = "generate-mipmaps",
             .default = .{ .value = false },
         }),
-        NamedArg.init(Image.Filter, .{
+        NamedArg.init(?Image.Filter, .{
+            .description = "defaults to the mitchell filter for LDR images, box for HDR images",
             .long = "filter",
-            .default = .{ .value = .mitchell },
+            .default = .{ .value = null },
         }),
         NamedArg.init(?Image.Filter, .{
             .description = "overrides --filter in the U direction",
@@ -254,8 +255,12 @@ pub fn main() !void {
 
     const maybe_address_mode_u = args.named.@"address-mode-u" orelse args.named.@"address-mode";
     const maybe_address_mode_v = args.named.@"address-mode-v" orelse args.named.@"address-mode";
-    const filter_u = args.named.@"filter-u" orelse args.named.filter;
-    const filter_v = args.named.@"filter-v" orelse args.named.filter;
+    const default_filter: Image.Filter = switch (encoding) {
+        .bc7, .@"rgba-u8" => .mitchell,
+        .@"rgba-f32" => .box,
+    };
+    const filter_u = args.named.@"filter-u" orelse args.named.filter orelse default_filter;
+    const filter_v = args.named.@"filter-v" orelse args.named.filter orelse default_filter;
     if (filter_u == .box and maybe_address_mode_u != null and maybe_address_mode_u != .clamp) {
         // Not supported by current STB, has no effect if set
         log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
@@ -265,6 +270,27 @@ pub fn main() !void {
         // Not supported by current STB, has no effect if set
         log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
         std.process.exit(1);
+    }
+    switch (encoding) {
+        .bc7, .@"rgba-u8" => {},
+        .@"rgba-f32" => {
+            // Sharpening filters can cause extreme artifacts on HDR images. See #15 for more
+            // information.
+            if (filter_u.sharpens()) {
+                log.err(
+                    "{s}: {s} filter applies sharpening, is not compatible with HDR images",
+                    .{ args.positional.INPUT, @tagName(filter_u) },
+                );
+                std.process.exit(1);
+            }
+            if (filter_v.sharpens()) {
+                log.err(
+                    "{s}: {s} filter applies sharpening, is not compatible with HDR images",
+                    .{ args.positional.INPUT, @tagName(filter_v) },
+                );
+                std.process.exit(1);
+            }
+        },
     }
 
     const cwd = std.fs.cwd();
@@ -900,6 +926,13 @@ pub const Image = struct {
         @"catmull-rom" = c.STBIR_FILTER_CATMULLROM,
         mitchell = c.STBIR_FILTER_MITCHELL,
         @"point-sample" = c.STBIR_FILTER_POINT_SAMPLE,
+
+        pub fn sharpens(self: @This()) bool {
+            return switch (self) {
+                .box, .triangle, .@"point-sample", .@"cubic-b-spline" => false,
+                .mitchell, .@"catmull-rom" => true,
+            };
+        }
     };
 
     pub const Error = error{
