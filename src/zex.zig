@@ -68,6 +68,11 @@ const command: Command = .{
             .long = "generate-mipmaps",
             .default = .{ .value = false },
         }),
+        NamedArg.init(?f32, .{
+            .description = "outputs a cutout texture with the given threshold, preserves alpha coverage when sampling",
+            .long = "cutout",
+            .default = .{ .value = null },
+        }),
         NamedArg.init(?Image.Filter, .{
             .description = "defaults to the mitchell filter for LDR images, box for HDR images",
             .long = "filter",
@@ -253,6 +258,11 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
+    if (args.named.@"alpha-input" == .premultiplied and args.named.cutout != null) {
+        log.err("cutout texture inputs must have straight alpha", .{});
+        std.process.exit(1);
+    }
+
     const maybe_address_mode_u = args.named.@"address-mode-u" orelse args.named.@"address-mode";
     const maybe_address_mode_v = args.named.@"address-mode-v" orelse args.named.@"address-mode";
     const default_filter: Image.Filter = switch (encoding) {
@@ -308,13 +318,9 @@ pub fn main() !void {
     };
     defer allocator.free(input_bytes);
 
-    var raw_levels: std.BoundedArray(Image, Ktx2.max_levels) = .{};
-    defer for (raw_levels.constSlice()[1..]) |level| {
-        level.deinit();
-    };
     const premultiply = args.named.@"alpha-input" == .straight and
         args.named.@"alpha-output" == .premultiplied;
-    raw_levels.appendAssumeCapacity(Image.init(.{
+    const original = Image.init(.{
         .bytes = input_bytes,
         .channels = .@"4",
         .premultiply = premultiply,
@@ -334,12 +340,16 @@ pub fn main() !void {
             log.err("{s}: cannot store LDR input image as HDR format", .{args.positional.INPUT});
             std.process.exit(1);
         },
-    });
+    };
+    defer original.deinit();
 
-    // Scale the first level if requested
+    // Copy the original image into the mip levels, scaling it if needed.
+    var raw_levels: std.BoundedArray(Image, Ktx2.max_levels) = .{};
+    defer for (raw_levels.constSlice()[1..]) |level| {
+        level.deinit();
+    };
     {
         // Read the scale parameters
-        var image = raw_levels.get(0);
         const maybe_max_width = args.named.@"max-width" orelse args.named.@"max-size";
         const maybe_max_height = args.named.@"max-height" orelse args.named.@"max-size";
 
@@ -348,8 +358,8 @@ pub fn main() !void {
             // If it was, validate the other input arguments, even if it turns out that the image
             // is already small enough (an artist resizing an input image shouldn't cause a
             // previously working bake step to start failing!)
-            const max_width = maybe_max_width orelse image.width;
-            const max_height = maybe_max_height orelse image.height;
+            const max_width = maybe_max_width orelse original.width;
+            const max_height = maybe_max_height orelse original.height;
             const address_mode_u = maybe_address_mode_u orelse {
                 log.err("{s}: address-mode not set", .{args.positional.INPUT});
                 std.process.exit(1);
@@ -360,26 +370,28 @@ pub fn main() !void {
             };
 
             // Perform the resize if one is necessary
-            if (max_width < image.width or max_height < image.height) {
-                const x_scale = @as(f64, @floatFromInt(max_width)) / @as(f64, @floatFromInt(image.width));
-                const y_scale = @as(f64, @floatFromInt(max_height)) / @as(f64, @floatFromInt(image.height));
-                const scale = @min(x_scale, y_scale);
-                const width = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(image.width)))), max_width);
-                const height = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(image.height)))), max_height);
-                const scaled = image.resize(.{
-                    .width = width,
-                    .height = height,
-                    .address_mode_u = address_mode_u,
-                    .address_mode_v = address_mode_v,
-                    .filter_u = filter_u,
-                    .filter_v = filter_v,
-                }) orelse {
-                    log.err("{s}: resize failed", .{args.positional.INPUT});
-                    std.process.exit(1);
-                };
-                raw_levels.pop().deinit();
-                raw_levels.appendAssumeCapacity(scaled);
-            }
+            const x_scale = @min(@as(f64, @floatFromInt(max_width)) / @as(f64, @floatFromInt(original.width)), 1.0);
+            const y_scale = @min(@as(f64, @floatFromInt(max_height)) / @as(f64, @floatFromInt(original.height)), 1.0);
+            const scale = @min(x_scale, y_scale);
+            const width = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(original.width)))), max_width);
+            const height = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(original.height)))), max_height);
+            const scaled = original.resize(.{
+                .width = width,
+                .height = height,
+                .address_mode_u = address_mode_u,
+                .address_mode_v = address_mode_v,
+                .filter_u = filter_u,
+                .filter_v = filter_v,
+            }) orelse {
+                log.err("{s}: resize failed", .{args.positional.INPUT});
+                std.process.exit(1);
+            };
+            raw_levels.appendAssumeCapacity(scaled);
+        } else {
+            raw_levels.appendAssumeCapacity(original.copy() orelse {
+                log.err("{s}: out of memory", .{args.positional.INPUT});
+                std.process.exit(1);
+            });
         }
     }
 
@@ -415,6 +427,58 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             raw_levels.appendAssumeCapacity(image);
+        }
+    }
+
+    // Cutout the textures if requested
+    if (args.named.cutout) |threshold| {
+        if (threshold < 0.0 or threshold > 1.0) {
+            log.err("{s}: cutout threshold must be between 0 and 1 inclusive", .{args.positional.INPUT});
+            std.process.exit(1);
+        }
+
+        const target_coverage = original.alphaCoverage(threshold, 1.0);
+        log.err("target coverage: {d}", .{target_coverage});
+
+        for (raw_levels.constSlice(), 0..) |level, level_i| {
+            const channels: u8 = @intFromEnum(level.channels);
+            switch (level.ty) {
+                .u8, .u8_srgb => {
+                    const threshold_int: u8 = @intFromFloat(std.math.clamp(threshold, 0.0, 1.0) * 255.0);
+                    var best_scale: f32 = 1.0;
+                    if (level_i > 0) {
+                        var best_dist = std.math.inf(f32);
+                        var upper_threshold: f32 = 1.0;
+                        var lower_threshold: f32 = 0.0;
+                        var curr_threshold: f32 = threshold;
+                        for (0..10) |_| {
+                            const curr_scale = threshold / curr_threshold;
+                            const coverage = level.alphaCoverage(threshold, curr_scale);
+                            const dist_to_coverage = @abs(coverage - target_coverage);
+                            if (dist_to_coverage < best_dist) {
+                                best_dist = dist_to_coverage;
+                                best_scale = curr_scale;
+                            }
+
+                            if (coverage < target_coverage) {
+                                upper_threshold = curr_threshold;
+                            } else {
+                                lower_threshold = curr_threshold;
+                            }
+                            curr_threshold = (lower_threshold + upper_threshold) / 2.0;
+                        }
+                    }
+
+                    for (0..level.width * level.height) |i| {
+                        const alpha = &level.data[i * channels + 3];
+                        alpha.* = @intFromFloat(@min(255.0, @as(f32, @floatFromInt(alpha.*)) * best_scale));
+                        alpha.* = if (alpha.* <= threshold_int) 0 else 255;
+                    }
+                },
+                .f32 => {
+                    @panic("unimplemented");
+                },
+            }
         }
     }
 
@@ -898,18 +962,12 @@ pub const Image = struct {
     pub const DataType = enum(c_uint) {
         u8 = c.STBIR_TYPE_UINT8,
         u8_srgb = c.STBIR_TYPE_UINT8_SRGB,
-        // "alpha channel, when present, should also be SRGB (this is very unusual)"
-        u8_srgb_alpha = c.STBIR_TYPE_UINT8_SRGB_ALPHA,
-        u16 = c.STBIR_TYPE_UINT16,
         f32 = c.STBIR_TYPE_FLOAT,
-        f16 = c.STBIR_TYPE_HALF_FLOAT,
 
         pub fn bytesPerChannel(self: @This()) u8 {
             return switch (self) {
-                .u8, .u8_srgb, .u8_srgb_alpha => 1,
-                .u16 => 2,
+                .u8, .u8_srgb => 1,
                 .f32 => 4,
-                .f16 => 2,
             };
         }
     };
@@ -948,7 +1006,7 @@ pub const Image = struct {
     };
     pub fn init(options: InitOptions) Error!@This() {
         switch (options.ty) {
-            .u8, .u8_srgb, .u8_srgb_alpha => {
+            .u8, .u8_srgb => {
                 var width: c_int = 0;
                 var height: c_int = 0;
                 var input_channels: c_int = 0;
@@ -1021,7 +1079,6 @@ pub const Image = struct {
 
                 return image;
             },
-            else => std.debug.panic("unsupported data type {}", .{options.ty}),
         }
     }
 
@@ -1037,6 +1094,18 @@ pub const Image = struct {
         filter_u: Filter,
         filter_v: Filter,
     };
+
+    pub fn copy(self: @This()) ?Image {
+        const data: [*]u8 = @ptrCast(std.c.malloc(self.data.len) orelse return null);
+        @memcpy(data, self.data);
+        return .{
+            .width = self.width,
+            .height = self.height,
+            .channels = self.channels,
+            .ty = self.ty,
+            .data = data[0..self.data.len],
+        };
+    }
 
     pub fn resize(self: @This(), options: ResizeOptions) ?Image {
         if (options.width == 0 or options.height == 0) return null;
@@ -1084,5 +1153,29 @@ pub const Image = struct {
             .ty = self.ty,
             .data = data[0..output_size],
         };
+    }
+
+    pub fn alphaCoverage(self: @This(), threshold: f32, scale: f32) f32 {
+        const channels: u8 = @intFromEnum(self.channels);
+        if (channels != 4) return 1.0;
+
+        switch (self.ty) {
+            .u8, .u8_srgb => {
+                const threshold_clamped = std.math.clamp(threshold, 0.0, 1.0);
+                const threshold_int: u8 = @intFromFloat(threshold_clamped * 255.0);
+
+                var coverage: f32 = 0;
+                for (0..self.width * self.height) |i| {
+                    const alpha: f32 = @floatFromInt(self.data[i * channels + 3]);
+                    const alpha_scaled: u8 = @intFromFloat(std.math.clamp(@as(f32, alpha) * scale, 0, 255.0));
+                    if (alpha_scaled > threshold_int) coverage += 1.0;
+                }
+                coverage /= @floatFromInt(self.width * self.height);
+                return coverage;
+            },
+            .f32 => {
+                @panic("unimplemented");
+            },
+        }
     }
 };
