@@ -1,4 +1,8 @@
+const std = @import("std");
+const log = std.log;
 const c = @import("c.zig");
+
+const Image = @This();
 
 width: u32,
 height: u32,
@@ -20,7 +24,7 @@ pub const InitOptions = struct {
     color_space: @This().ColorSpace,
 };
 
-pub fn init(options: InitOptions) InitError!@This() {
+pub fn init(options: InitOptions) InitError!Image {
     // Don't allow upsampling LDR to HDR.
     switch (options.color_space) {
         .linear, .srgb => {},
@@ -64,11 +68,11 @@ pub fn init(options: InitOptions) InitError!@This() {
     };
 }
 
-pub fn deinit(self: @This()) void {
+pub fn deinit(self: Image) void {
     c.stbi_image_free(self.data.ptr);
 }
 
-pub fn premultiply(self: @This()) void {
+pub fn premultiply(self: Image) void {
     var px: usize = 0;
     while (px < @as(usize, self.width) * @as(usize, self.height) * 4) : (px += 4) {
         const a = self.data[px + 3];
@@ -78,7 +82,7 @@ pub fn premultiply(self: @This()) void {
     }
 }
 
-pub fn copy(self: @This()) ?@This() {
+pub fn copy(self: Image) ?Image {
     const data_ptr: [*]f32 = @ptrCast(@alignCast(c.malloc(
         self.data.len * @sizeOf(f32),
     ) orelse return null));
@@ -99,7 +103,6 @@ pub const ResizeOptions = struct {
         zero = c.STBIR_EDGE_ZERO,
     };
 
-    // XXX: shouldn't have to name things like this in here
     pub const Filter = enum(c_uint) {
         box = c.STBIR_FILTER_BOX,
         triangle = c.STBIR_FILTER_TRIANGLE,
@@ -124,8 +127,9 @@ pub const ResizeOptions = struct {
     filter_v: Filter,
 };
 
-pub fn resize(self: @This(), options: ResizeOptions) ?@This() {
+pub fn resize(self: Image, options: ResizeOptions) ?Image {
     if (options.width == 0 or options.height == 0) return null;
+    if (options.width == self.width and options.height == self.height) return self.copy();
 
     const input_stride = @as(usize, self.width) * @sizeOf(f32) * 4;
     const output_stride = @as(usize, options.width) * @sizeOf(f32) * 4;
@@ -167,7 +171,7 @@ pub fn resize(self: @This(), options: ResizeOptions) ?@This() {
     };
 }
 
-pub fn alphaCoverage(self: @This(), threshold: f32, scale: f32) f32 {
+pub fn alphaCoverage(self: Image, threshold: f32, scale: f32) f32 {
     var coverage: f32 = 0;
     for (0..@as(usize, self.width) * @as(usize, self.height)) |i| {
         const alpha = self.data[i * 4 + 3];
@@ -176,3 +180,46 @@ pub fn alphaCoverage(self: @This(), threshold: f32, scale: f32) f32 {
     coverage /= @floatFromInt(@as(usize, self.width) * @as(usize, self.height));
     return coverage;
 }
+
+pub const GenerateMipMapsOptions = struct {
+    block_size: u8,
+    address_mode_u: ResizeOptions.AddressMode,
+    address_mode_v: ResizeOptions.AddressMode,
+    filter_u: ResizeOptions.Filter,
+    filter_v: ResizeOptions.Filter,
+};
+
+pub fn generateMipmaps(self: Image, options: GenerateMipMapsOptions) GenerateMipmaps {
+    return .{
+        .options = options,
+        .image = self,
+    };
+}
+
+pub const GenerateMipmaps = struct {
+    options: GenerateMipMapsOptions,
+    image: Image,
+
+    pub fn next(self: *@This()) ?Image {
+        // Stop once we're below the block size, there's no benefit to further mipmaps
+        if (self.image.width <= self.options.block_size and
+            self.image.height <= self.options.block_size)
+        {
+            return null;
+        }
+
+        // Halve the image size
+        self.image = self.image.resize(.{
+            .width = @max(1, self.image.width / 2),
+            .height = @max(1, self.image.height / 2),
+            .address_mode_u = self.options.address_mode_u,
+            .address_mode_v = self.options.address_mode_v,
+            .filter_u = self.options.filter_u,
+            .filter_v = self.options.filter_v,
+        }) orelse {
+            log.err("mipmap generation failed", .{});
+            std.process.exit(1);
+        };
+        return self.image;
+    }
+};

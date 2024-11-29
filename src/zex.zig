@@ -405,25 +405,18 @@ pub fn main() !void {
 
         const block_size: u8 = switch (encoding) {
             .@"rgba-u8", .@"rgba-f32" => 1,
-            // We're allowed to go smaller than the block size, but there's no benefit to doing
-            // so
             .bc7 => 4,
         };
 
-        var image = raw_levels.get(0);
-        while (image.width > block_size or image.height > block_size) {
-            image = image.resize(.{
-                .width = @max(1, image.width / 2),
-                .height = @max(1, image.height / 2),
-                .address_mode_u = address_mode_u,
-                .address_mode_v = address_mode_v,
-                .filter_u = filter_u,
-                .filter_v = filter_v,
-            }) orelse {
-                log.err("{s}: mipmap generation failed", .{args.positional.INPUT});
-                std.process.exit(1);
-            };
-            raw_levels.appendAssumeCapacity(image);
+        var generate_mipmaps = raw_levels.get(0).generateMipmaps(.{
+            .address_mode_u = address_mode_u,
+            .address_mode_v = address_mode_v,
+            .filter_u = filter_u,
+            .filter_v = filter_v,
+            .block_size = block_size,
+        });
+        while (generate_mipmaps.next()) |mipmap| {
+            raw_levels.appendAssumeCapacity(mipmap);
         }
     }
 
