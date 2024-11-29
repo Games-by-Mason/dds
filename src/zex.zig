@@ -8,11 +8,8 @@ const Command = structopt.Command;
 const NamedArg = structopt.NamedArg;
 const PositionalArg = structopt.PositionalArg;
 const log = std.log;
-
-const c = @cImport({
-    @cInclude("stb_image.h");
-    @cInclude("stb_image_resize2.h");
-});
+const c = @import("c.zig");
+const Image = @import("Image.zig");
 
 const max_file_len = 4294967296;
 
@@ -73,31 +70,31 @@ const command: Command = .{
             .long = "cutout",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.Filter, .{
+        NamedArg.init(?Image.ResizeOptions.Filter, .{
             .description = "defaults to the mitchell filter for LDR images, box for HDR images",
             .long = "filter",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.Filter, .{
+        NamedArg.init(?Image.ResizeOptions.Filter, .{
             .description = "overrides --filter in the U direction",
             .long = "filter-u",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.Filter, .{
+        NamedArg.init(?Image.ResizeOptions.Filter, .{
             .description = "overrides --filter in the V direction",
             .long = "filter-v",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.AddressMode, .{
+        NamedArg.init(?Image.ResizeOptions.AddressMode, .{
             .long = "address-mode",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.AddressMode, .{
+        NamedArg.init(?Image.ResizeOptions.AddressMode, .{
             .description = "overrides --address-mode in the U direction",
             .long = "address-mode-u",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.AddressMode, .{
+        NamedArg.init(?Image.ResizeOptions.AddressMode, .{
             .description = "overrides --address-mode in the V direction",
             .long = "address-mode-v",
             .default = .{ .value = null },
@@ -265,7 +262,7 @@ pub fn main() !void {
 
     const maybe_address_mode_u = args.named.@"address-mode-u" orelse args.named.@"address-mode";
     const maybe_address_mode_v = args.named.@"address-mode-v" orelse args.named.@"address-mode";
-    const default_filter: Image.Filter = switch (encoding) {
+    const default_filter: Image.ResizeOptions.Filter = switch (encoding) {
         .bc7, .@"rgba-u8" => .mitchell,
         .@"rgba-f32" => .box,
     };
@@ -318,11 +315,8 @@ pub fn main() !void {
     };
     defer allocator.free(input_bytes);
 
-    const premultiply = args.named.@"alpha-input" == .straight and
-        args.named.@"alpha-output" == .premultiplied;
     const original = Image.init(.{
         .bytes = input_bytes,
-        .premultiply = premultiply,
         .color_space = switch (encoding) {
             inline .bc7, .@"rgba-u8" => |ec| switch (ec.named.@"color-space") {
                 .srgb => .srgb,
@@ -341,6 +335,10 @@ pub fn main() !void {
         },
     };
     defer original.deinit();
+
+    if (args.named.@"alpha-input" == .straight and args.named.@"alpha-output" == .premultiplied) {
+        original.premultiply();
+    }
 
     // Copy the original image into the mip levels, scaling it if needed.
     var raw_levels: std.BoundedArray(Image, Ktx2.max_levels) = .{};
@@ -966,184 +964,4 @@ const Bc7Enc = opaque {
     ) callconv(.C) bool;
     extern fn bc7enc_getBlocks(self: *@This()) callconv(.C) [*]u8;
     extern fn bc7enc_getTotalBlocksSizeInBytes(self: *@This()) callconv(.C) u32;
-};
-
-pub const Image = struct {
-    width: u32,
-    height: u32,
-    data: []f32,
-
-    pub const AddressMode = enum(c_uint) {
-        clamp = c.STBIR_EDGE_CLAMP,
-        reflect = c.STBIR_EDGE_REFLECT,
-        wrap = c.STBIR_EDGE_WRAP,
-        zero = c.STBIR_EDGE_ZERO,
-    };
-    pub const Filter = enum(c_uint) {
-        box = c.STBIR_FILTER_BOX,
-        triangle = c.STBIR_FILTER_TRIANGLE,
-        @"cubic-b-spline" = c.STBIR_FILTER_CUBICBSPLINE,
-        @"catmull-rom" = c.STBIR_FILTER_CATMULLROM,
-        mitchell = c.STBIR_FILTER_MITCHELL,
-        @"point-sample" = c.STBIR_FILTER_POINT_SAMPLE,
-
-        pub fn sharpens(self: @This()) bool {
-            return switch (self) {
-                .box, .triangle, .@"point-sample", .@"cubic-b-spline" => false,
-                .mitchell, .@"catmull-rom" => true,
-            };
-        }
-    };
-
-    pub const Error = error{
-        StbImageFailure,
-        LdrAsHdr,
-    };
-
-    pub const InitOptions = struct {
-        pub const ColorSpace = enum(c_uint) {
-            linear,
-            srgb,
-            hdr,
-        };
-
-        bytes: []const u8,
-        premultiply: bool,
-        color_space: @This().ColorSpace,
-    };
-    pub fn init(options: InitOptions) Error!@This() {
-        // Don't allow upsampling LDR to HDR.
-        switch (options.color_space) {
-            .linear, .srgb => {},
-            .hdr => if (c.stbi_is_hdr_from_memory(
-                options.bytes.ptr,
-                @intCast(options.bytes.len),
-            ) == 0) return error.LdrAsHdr,
-        }
-
-        // All images are loaded as linear floats regardless of the source and dest formats.
-        //
-        // Rational:
-        // - Increases precision of any manipulations done to the image (e.g. repeated downsampling
-        //   for mipmap generation)
-        // - Saves us from having separate branches for LDR and HDR processing
-        //
-        // There's no technical benefit in the case where no processing is done, but this is not the
-        // common case.
-        c.stbi_ldr_to_hdr_gamma(switch (options.color_space) {
-            .srgb => 2.2,
-            .linear, .hdr => 1.0,
-        });
-        var width: c_int = 0;
-        var height: c_int = 0;
-        var input_channels: c_int = 0;
-        const data_ptr = c.stbi_loadf_from_memory(
-            options.bytes.ptr,
-            @intCast(options.bytes.len),
-            &width,
-            &height,
-            &input_channels,
-            4,
-        ) orelse return error.StbImageFailure;
-
-        // Create the image
-        const data_len = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
-        const image: @This() = .{
-            .width = @intCast(width),
-            .height = @intCast(height),
-            .data = data_ptr[0..data_len],
-        };
-
-        // Premultiply the alpha if requested
-        if (options.premultiply) {
-            var px: usize = 0;
-            while (px < @as(usize, image.width) * @as(usize, image.height) * 4) : (px += 4) {
-                const a = image.data[px + 3];
-                image.data[px + 0] = image.data[px + 0] * a;
-                image.data[px + 1] = image.data[px + 1] * a;
-                image.data[px + 2] = image.data[px + 2] * a;
-            }
-        }
-
-        return image;
-    }
-
-    pub fn deinit(self: @This()) void {
-        c.stbi_image_free(self.data.ptr);
-    }
-
-    pub const ResizeOptions = struct {
-        width: u32,
-        height: u32,
-        address_mode_u: AddressMode,
-        address_mode_v: AddressMode,
-        filter_u: Filter,
-        filter_v: Filter,
-    };
-
-    pub fn copy(self: @This()) ?Image {
-        const data_unsized: [*]f32 = @ptrCast(@alignCast(std.c.malloc(
-            self.data.len * @sizeOf(f32),
-        ) orelse return null));
-        const data = data_unsized[0..self.data.len];
-        @memcpy(data, self.data);
-        return .{
-            .width = self.width,
-            .height = self.height,
-            .data = data,
-        };
-    }
-
-    pub fn resize(self: @This(), options: ResizeOptions) ?Image {
-        if (options.width == 0 or options.height == 0) return null;
-
-        const input_stride = @as(usize, self.width) * @sizeOf(f32) * 4;
-        const output_stride = @as(usize, options.width) * @sizeOf(f32) * 4;
-        const output_size = @as(usize, options.height) * output_stride;
-        const data: [*]f32 = @ptrCast(@alignCast(std.c.malloc(
-            output_size,
-        ) orelse return null));
-
-        var stbr_options: c.STBIR_RESIZE = undefined;
-        c.stbir_resize_init(
-            &stbr_options,
-            self.data.ptr,
-            @intCast(self.width),
-            @intCast(self.height),
-            @intCast(input_stride),
-            data,
-            @intCast(options.width),
-            @intCast(options.height),
-            @intCast(output_stride),
-            // We always premultiply alpha channels ourselves if they represent transparency
-            c.STBIR_RGBA_PM,
-            c.STBIR_TYPE_FLOAT,
-        );
-
-        stbr_options.horizontal_edge = @intFromEnum(options.address_mode_u);
-        stbr_options.vertical_edge = @intFromEnum(options.address_mode_v);
-        stbr_options.horizontal_filter = @intFromEnum(options.filter_u);
-        stbr_options.vertical_filter = @intFromEnum(options.filter_v);
-
-        if (c.stbir_resize_extended(&stbr_options) != 1) {
-            std.c.free(data);
-            return null;
-        }
-
-        return .{
-            .width = options.width,
-            .height = options.height,
-            .data = data[0..output_size],
-        };
-    }
-
-    pub fn alphaCoverage(self: @This(), threshold: f32, scale: f32) f32 {
-        var coverage: f32 = 0;
-        for (0..@as(usize, self.width) * @as(usize, self.height)) |i| {
-            const alpha = self.data[i * 4 + 3];
-            if (alpha * scale > threshold) coverage += 1.0;
-        }
-        coverage /= @floatFromInt(@as(usize, self.width) * @as(usize, self.height));
-        return coverage;
-    }
 };
