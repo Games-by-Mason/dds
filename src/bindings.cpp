@@ -26,18 +26,30 @@ extern "C" {
 		rdo_bc::rdo_bc_params * const params,
 		uint32_t width,
 		uint32_t height,
-		uint8_t * const pixels
+		float * const pixels
 	) {
+		// Encode the image as u8s. We need to do this before initializing the encoder, since doing
+		// so may change the perceptual param that we reference here.
 		utils::image_u8 img;
 		img.init(width, height);
-		memcpy(&img.get_pixels()[0], &pixels[0], width * height * sizeof(uint32_t));
+		auto u8s = img.get_pixels();
+		for (size_t i = 0; i < (size_t)width * (size_t)height * 4; ++i) {
+			float ldr = pixels[i];
+			if (params->m_perceptual && i % 4 != 3) ldr = pow(ldr, 1.0f / 2.2f);
+			ldr = ldr * 255.0f + 0.5f;
+			if (ldr < 0.0f) {
+				ldr = 0.0f;
+			} else if (ldr > 255.0f) {
+				ldr = 255.0f;
+			}
+			u8s[i] = (uint8_t)ldr;
+		}
 
+		// Encode the data as BC7. This may modify params which is referenced above.
 		if (!encoder->init(img, *params)) {
 			return false;
 		}
-
 		if (!encoder->encode()) return false;
-
 		return true;
 	}
 

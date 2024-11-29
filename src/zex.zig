@@ -322,14 +322,13 @@ pub fn main() !void {
         args.named.@"alpha-output" == .premultiplied;
     const original = Image.init(.{
         .bytes = input_bytes,
-        .channels = .@"4",
         .premultiply = premultiply,
-        .ty = switch (encoding) {
+        .color_space = switch (encoding) {
             inline .bc7, .@"rgba-u8" => |ec| switch (ec.named.@"color-space") {
-                .srgb => .u8_srgb,
-                .linear => .u8,
+                .srgb => .srgb,
+                .linear => .linear,
             },
-            .@"rgba-f32" => .f32,
+            .@"rgba-f32" => .hdr,
         },
     }) catch |err| switch (err) {
         error.StbImageFailure => {
@@ -431,53 +430,51 @@ pub fn main() !void {
     }
 
     // Cutout the textures if requested
-    if (args.named.cutout) |threshold| {
-        if (threshold < 0.0 or threshold > 1.0) {
+    if (args.named.cutout) |threshold_raw| {
+        // Check the threshold's range, and quantize it if necessary
+        if (threshold_raw < 0.0 or threshold_raw > 1.0) {
             log.err("{s}: cutout threshold must be between 0 and 1 inclusive", .{args.positional.INPUT});
             std.process.exit(1);
         }
+        const threshold = switch (encoding) {
+            .@"rgba-u8", .bc7 => @round(threshold_raw * 255.0) / 255.0,
+            .@"rgba-f32" => threshold_raw,
+        };
 
+        // Determine the target coverage
         const target_coverage = original.alphaCoverage(threshold, 1.0);
-        log.err("target coverage: {d}", .{target_coverage});
 
+        // Process each mip level
         for (raw_levels.constSlice(), 0..) |level, level_i| {
-            const channels: u8 = @intFromEnum(level.channels);
-            switch (level.ty) {
-                .u8, .u8_srgb => {
-                    const threshold_int: u8 = @intFromFloat(std.math.clamp(threshold, 0.0, 1.0) * 255.0);
-                    var best_scale: f32 = 1.0;
-                    if (level_i > 0) {
-                        var best_dist = std.math.inf(f32);
-                        var upper_threshold: f32 = 1.0;
-                        var lower_threshold: f32 = 0.0;
-                        var curr_threshold: f32 = threshold;
-                        for (0..10) |_| {
-                            const curr_scale = threshold / curr_threshold;
-                            const coverage = level.alphaCoverage(threshold, curr_scale);
-                            const dist_to_coverage = @abs(coverage - target_coverage);
-                            if (dist_to_coverage < best_dist) {
-                                best_dist = dist_to_coverage;
-                                best_scale = curr_scale;
-                            }
-
-                            if (coverage < target_coverage) {
-                                upper_threshold = curr_threshold;
-                            } else {
-                                lower_threshold = curr_threshold;
-                            }
-                            curr_threshold = (lower_threshold + upper_threshold) / 2.0;
-                        }
+            // Binary search for the best parameters
+            var best_scale: f32 = 1.0;
+            if (level_i > 0) {
+                var best_dist = std.math.inf(f32);
+                var upper_threshold: f32 = 1.0;
+                var lower_threshold: f32 = 0.0;
+                var curr_threshold: f32 = threshold;
+                for (0..10) |_| {
+                    const curr_scale = threshold / curr_threshold;
+                    const coverage = level.alphaCoverage(threshold, curr_scale);
+                    const dist_to_coverage = @abs(coverage - target_coverage);
+                    if (dist_to_coverage < best_dist) {
+                        best_dist = dist_to_coverage;
+                        best_scale = curr_scale;
                     }
 
-                    for (0..level.width * level.height) |i| {
-                        const alpha = &level.data[i * channels + 3];
-                        alpha.* = @intFromFloat(@min(255.0, @as(f32, @floatFromInt(alpha.*)) * best_scale));
-                        alpha.* = if (alpha.* <= threshold_int) 0 else 255;
+                    if (coverage < target_coverage) {
+                        upper_threshold = curr_threshold;
+                    } else {
+                        lower_threshold = curr_threshold;
                     }
-                },
-                .f32 => {
-                    @panic("unimplemented");
-                },
+                    curr_threshold = (lower_threshold + upper_threshold) / 2.0;
+                }
+            }
+
+            // Apply the scaling and cutout the image
+            for (0..@as(usize, level.width) * @as(usize, level.height)) |i| {
+                const alpha = &level.data[i * 4 + 3];
+                alpha.* = if (alpha.* * best_scale <= threshold) 0.0 else 1.0;
             }
         }
     }
@@ -487,10 +484,30 @@ pub fn main() !void {
     defer for (bc7_encoders.constSlice()) |bc7_encoder| {
         bc7_encoder.deinit();
     };
+    var u8_encodings: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
+    defer for (u8_encodings.constSlice()) |u8_encoding| {
+        allocator.free(u8_encoding);
+    };
     var encoded_levels: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
     switch (encoding) {
-        .@"rgba-u8", .@"rgba-f32" => for (raw_levels.constSlice()) |raw_level| {
-            encoded_levels.appendAssumeCapacity(raw_level.data);
+        .@"rgba-u8" => |encoding_options| for (raw_levels.constSlice()) |raw_level| {
+            const encoded_level = allocator.alloc(u8, raw_level.data.len) catch {
+                log.err("{s}: out of memory", .{args.positional.INPUT});
+                std.process.exit(1);
+            };
+            for (0..@as(usize, raw_level.width) * @as(usize, raw_level.height) * 4) |i| {
+                var ldr = raw_level.data[i];
+                if (encoding_options.named.@"color-space" == .srgb and i % 4 != 3) {
+                    ldr = std.math.pow(f32, ldr, 1.0 / 2.2);
+                }
+                ldr = std.math.clamp(ldr * 255.0 + 0.5, 0.0, 255.0);
+                encoded_level[i] = @intFromFloat(ldr);
+            }
+            u8_encodings.appendAssumeCapacity(encoded_level);
+            encoded_levels.appendAssumeCapacity(encoded_level);
+        },
+        .@"rgba-f32" => for (raw_levels.constSlice()) |raw_level| {
+            encoded_levels.appendAssumeCapacity(std.mem.sliceAsBytes(raw_level.data));
         },
         .bc7 => |bc7| {
             // Determine the bc7 params
@@ -509,7 +526,8 @@ pub fn main() !void {
                     std.process.exit(1);
                 }
                 params.max_partitions_to_scan = bc7.named.@"max-partitions-to-scan";
-                // Ignored when using RDO (fine to set regardless, is cleared upstream)
+                // Ignored when using RDO. However, we use it in our bindings. The actual encoder
+                // just clears it so it doesn't matter that we set it regardless.
                 params.perceptual = bc7.named.@"color-space" == .srgb;
                 params.mode6_only = bc7.named.@"mode-6-only";
 
@@ -580,7 +598,12 @@ pub fn main() !void {
 
                 const bc7_encoder = bc7_encoders.get(bc7_encoders.len - 1);
 
-                if (!bc7_encoder.encode(&params, raw_level.width, raw_level.height, raw_level.data.ptr)) {
+                if (!bc7_encoder.encode(
+                    &params,
+                    raw_level.width,
+                    raw_level.height,
+                    raw_level.data.ptr,
+                )) {
                     log.err("{s}: encoder failed", .{args.positional.INPUT});
                     std.process.exit(1);
                 }
@@ -687,11 +710,11 @@ pub fn main() !void {
     {
         // Calculate the byte offsets, taking into account that KTX2 requires mipmaps be stored from
         // largest to smallest for streaming purposes
-        var byte_offsets_reverse: std.BoundedArray(u64, Ktx2.max_levels) = .{};
+        var byte_offsets_reverse: std.BoundedArray(usize, Ktx2.max_levels) = .{};
         {
-            var byte_offset: u64 = index.dfd_byte_offset + index.dfd_byte_length;
+            var byte_offset: usize = index.dfd_byte_offset + index.dfd_byte_length;
             for (0..compressed_levels.len) |i| {
-                byte_offset = std.mem.alignForward(u64, byte_offset, level_alignment);
+                byte_offset = std.mem.alignForward(usize, byte_offset, level_alignment);
                 const compressed_level = compressed_levels.get(compressed_levels.len - i - 1);
                 byte_offsets_reverse.appendAssumeCapacity(byte_offset);
                 byte_offset += compressed_level.len;
@@ -829,10 +852,10 @@ pub fn main() !void {
     // Write the compressed data. Note that KTX2 requires mips be stored form smallest to largest
     // for streaming purposes.
     {
-        var byte_offset: u64 = index.dfd_byte_offset + index.dfd_byte_length;
+        var byte_offset: usize = index.dfd_byte_offset + index.dfd_byte_length;
         for (0..compressed_levels.len) |i| {
             // Write padding
-            const padded = std.mem.alignForward(u64, byte_offset, level_alignment);
+            const padded = std.mem.alignForward(usize, byte_offset, level_alignment);
             writer.writeByteNTimes(0, padded - byte_offset) catch |err| {
                 log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
                 std.process.exit(1);
@@ -939,7 +962,7 @@ const Bc7Enc = opaque {
         params: *const Params,
         width: u32,
         height: u32,
-        pixels: [*]const u8,
+        pixels: [*]const f32,
     ) callconv(.C) bool;
     extern fn bc7enc_getBlocks(self: *@This()) callconv(.C) [*]u8;
     extern fn bc7enc_getTotalBlocksSizeInBytes(self: *@This()) callconv(.C) u32;
@@ -948,29 +971,8 @@ const Bc7Enc = opaque {
 pub const Image = struct {
     width: u32,
     height: u32,
-    ty: DataType,
-    channels: Channels,
-    data: []u8,
+    data: []f32,
 
-    pub const Channels = enum(u3) {
-        @"1" = 1,
-        @"2" = 2,
-        @"3" = 3,
-        @"4" = 4,
-    };
-
-    pub const DataType = enum(c_uint) {
-        u8 = c.STBIR_TYPE_UINT8,
-        u8_srgb = c.STBIR_TYPE_UINT8_SRGB,
-        f32 = c.STBIR_TYPE_FLOAT,
-
-        pub fn bytesPerChannel(self: @This()) u8 {
-            return switch (self) {
-                .u8, .u8_srgb => 1,
-                .f32 => 4,
-            };
-        }
-    };
     pub const AddressMode = enum(c_uint) {
         clamp = c.STBIR_EDGE_CLAMP,
         reflect = c.STBIR_EDGE_REFLECT,
@@ -999,87 +1001,71 @@ pub const Image = struct {
     };
 
     pub const InitOptions = struct {
+        pub const ColorSpace = enum(c_uint) {
+            linear,
+            srgb,
+            hdr,
+        };
+
         bytes: []const u8,
-        ty: DataType,
-        channels: Channels,
         premultiply: bool,
+        color_space: @This().ColorSpace,
     };
     pub fn init(options: InitOptions) Error!@This() {
-        switch (options.ty) {
-            .u8, .u8_srgb => {
-                var width: c_int = 0;
-                var height: c_int = 0;
-                var input_channels: c_int = 0;
-                const data = c.stbi_load_from_memory(
-                    options.bytes.ptr,
-                    @intCast(options.bytes.len),
-                    &width,
-                    &height,
-                    &input_channels,
-                    @intFromEnum(options.channels),
-                ) orelse return error.StbImageFailure;
-
-                const len = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * @intFromEnum(options.channels);
-                const image: @This() = .{
-                    .width = @intCast(width),
-                    .height = @intCast(height),
-                    .channels = options.channels,
-                    .ty = options.ty,
-                    .data = data[0..len],
-                };
-
-                if (options.premultiply) {
-                    var px: usize = 0;
-                    while (px < image.width * image.height * 4) : (px += 4) {
-                        const a: f32 = @as(f32, @floatFromInt(image.data[px + 3])) / 255.0;
-                        image.data[px + 0] = @intFromFloat(@as(f32, @floatFromInt(image.data[px + 0])) * a);
-                        image.data[px + 1] = @intFromFloat(@as(f32, @floatFromInt(image.data[px + 1])) * a);
-                        image.data[px + 2] = @intFromFloat(@as(f32, @floatFromInt(image.data[px + 2])) * a);
-                    }
-                }
-
-                return image;
-            },
-            .f32 => {
-                if (c.stbi_is_hdr_from_memory(options.bytes.ptr, @intCast(options.bytes.len)) == 0) {
-                    return error.LdrAsHdr;
-                }
-
-                var width: c_int = 0;
-                var height: c_int = 0;
-                var input_channels: c_int = 0;
-                const data_ptr = c.stbi_loadf_from_memory(
-                    options.bytes.ptr,
-                    @intCast(options.bytes.len),
-                    &width,
-                    &height,
-                    &input_channels,
-                    @intFromEnum(options.channels),
-                ) orelse return error.StbImageFailure;
-
-                const len = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * @intFromEnum(options.channels);
-                const data = data_ptr[0..len];
-                const image: @This() = .{
-                    .width = @intCast(width),
-                    .height = @intCast(height),
-                    .channels = options.channels,
-                    .ty = options.ty,
-                    .data = std.mem.sliceAsBytes(data),
-                };
-
-                if (options.premultiply) {
-                    var px: usize = 0;
-                    while (px < image.width * image.height * 4) : (px += 4) {
-                        const a = data[px + 3];
-                        data[px + 0] = data[px + 0] * a;
-                        data[px + 1] = data[px + 1] * a;
-                        data[px + 2] = data[px + 2] * a;
-                    }
-                }
-
-                return image;
-            },
+        // Don't allow upsampling LDR to HDR.
+        switch (options.color_space) {
+            .linear, .srgb => {},
+            .hdr => if (c.stbi_is_hdr_from_memory(
+                options.bytes.ptr,
+                @intCast(options.bytes.len),
+            ) == 0) return error.LdrAsHdr,
         }
+
+        // All images are loaded as linear floats regardless of the source and dest formats.
+        //
+        // Rational:
+        // - Increases precision of any manipulations done to the image (e.g. repeated downsampling
+        //   for mipmap generation)
+        // - Saves us from having separate branches for LDR and HDR processing
+        //
+        // There's no technical benefit in the case where no processing is done, but this is not the
+        // common case.
+        c.stbi_ldr_to_hdr_gamma(switch (options.color_space) {
+            .srgb => 2.2,
+            .linear, .hdr => 1.0,
+        });
+        var width: c_int = 0;
+        var height: c_int = 0;
+        var input_channels: c_int = 0;
+        const data_ptr = c.stbi_loadf_from_memory(
+            options.bytes.ptr,
+            @intCast(options.bytes.len),
+            &width,
+            &height,
+            &input_channels,
+            4,
+        ) orelse return error.StbImageFailure;
+
+        // Create the image
+        const data_len = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+        const image: @This() = .{
+            .width = @intCast(width),
+            .height = @intCast(height),
+            .data = data_ptr[0..data_len],
+        };
+
+        // Premultiply the alpha if requested
+        if (options.premultiply) {
+            var px: usize = 0;
+            while (px < @as(usize, image.width) * @as(usize, image.height) * 4) : (px += 4) {
+                const a = image.data[px + 3];
+                image.data[px + 0] = image.data[px + 0] * a;
+                image.data[px + 1] = image.data[px + 1] * a;
+                image.data[px + 2] = image.data[px + 2] * a;
+            }
+        }
+
+        return image;
     }
 
     pub fn deinit(self: @This()) void {
@@ -1096,24 +1082,27 @@ pub const Image = struct {
     };
 
     pub fn copy(self: @This()) ?Image {
-        const data: [*]u8 = @ptrCast(std.c.malloc(self.data.len) orelse return null);
+        const data_unsized: [*]f32 = @ptrCast(@alignCast(std.c.malloc(
+            self.data.len * @sizeOf(f32),
+        ) orelse return null));
+        const data = data_unsized[0..self.data.len];
         @memcpy(data, self.data);
         return .{
             .width = self.width,
             .height = self.height,
-            .channels = self.channels,
-            .ty = self.ty,
-            .data = data[0..self.data.len],
+            .data = data,
         };
     }
 
     pub fn resize(self: @This(), options: ResizeOptions) ?Image {
         if (options.width == 0 or options.height == 0) return null;
 
-        const input_stride = self.width * self.ty.bytesPerChannel() * @intFromEnum(self.channels);
-        const output_stride = options.width * self.ty.bytesPerChannel() * @intFromEnum(self.channels);
-        const output_size = options.height * output_stride;
-        const data: [*]u8 = @ptrCast(std.c.malloc(output_size) orelse return null);
+        const input_stride = @as(usize, self.width) * @sizeOf(f32) * 4;
+        const output_stride = @as(usize, options.width) * @sizeOf(f32) * 4;
+        const output_size = @as(usize, options.height) * output_stride;
+        const data: [*]f32 = @ptrCast(@alignCast(std.c.malloc(
+            output_size,
+        ) orelse return null));
 
         var stbr_options: c.STBIR_RESIZE = undefined;
         c.stbir_resize_init(
@@ -1126,14 +1115,9 @@ pub const Image = struct {
             @intCast(options.width),
             @intCast(options.height),
             @intCast(output_stride),
-            switch (self.channels) {
-                .@"1" => c.STBIR_1CHANNEL,
-                .@"2" => c.STBIR_2CHANNEL,
-                .@"3" => c.STBIR_RGB,
-                // We always premultiply alpha channels ourselves if they represent transparency
-                .@"4" => c.STBIR_RGBA_PM,
-            },
-            @intFromEnum(self.ty),
+            // We always premultiply alpha channels ourselves if they represent transparency
+            c.STBIR_RGBA_PM,
+            c.STBIR_TYPE_FLOAT,
         );
 
         stbr_options.horizontal_edge = @intFromEnum(options.address_mode_u);
@@ -1149,33 +1133,17 @@ pub const Image = struct {
         return .{
             .width = options.width,
             .height = options.height,
-            .channels = self.channels,
-            .ty = self.ty,
             .data = data[0..output_size],
         };
     }
 
     pub fn alphaCoverage(self: @This(), threshold: f32, scale: f32) f32 {
-        const channels: u8 = @intFromEnum(self.channels);
-        if (channels != 4) return 1.0;
-
-        switch (self.ty) {
-            .u8, .u8_srgb => {
-                const threshold_clamped = std.math.clamp(threshold, 0.0, 1.0);
-                const threshold_int: u8 = @intFromFloat(threshold_clamped * 255.0);
-
-                var coverage: f32 = 0;
-                for (0..self.width * self.height) |i| {
-                    const alpha: f32 = @floatFromInt(self.data[i * channels + 3]);
-                    const alpha_scaled: u8 = @intFromFloat(std.math.clamp(@as(f32, alpha) * scale, 0, 255.0));
-                    if (alpha_scaled > threshold_int) coverage += 1.0;
-                }
-                coverage /= @floatFromInt(self.width * self.height);
-                return coverage;
-            },
-            .f32 => {
-                @panic("unimplemented");
-            },
+        var coverage: f32 = 0;
+        for (0..@as(usize, self.width) * @as(usize, self.height)) |i| {
+            const alpha = self.data[i * 4 + 3];
+            if (alpha * scale > threshold) coverage += 1.0;
         }
+        coverage /= @floatFromInt(@as(usize, self.width) * @as(usize, self.height));
+        return coverage;
     }
 };
