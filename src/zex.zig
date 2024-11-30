@@ -8,11 +8,8 @@ const Command = structopt.Command;
 const NamedArg = structopt.NamedArg;
 const PositionalArg = structopt.PositionalArg;
 const log = std.log;
-
-const c = @cImport({
-    @cInclude("stb_image.h");
-    @cInclude("stb_image_resize2.h");
-});
+const c = @import("c.zig");
+const Image = @import("Image.zig");
 
 const max_file_len = 4294967296;
 
@@ -68,31 +65,41 @@ const command: Command = .{
             .long = "generate-mipmaps",
             .default = .{ .value = false },
         }),
-        NamedArg.init(?Image.Filter, .{
+        NamedArg.init(?f32, .{
+            .description = "preserves alpha coverage for the given alpha test threshold, slower but significantly improves mipmapping of cutouts and alpha to coverage textures",
+            .long = "preserve-alpha-coverage",
+            .default = .{ .value = null },
+        }),
+        NamedArg.init(u8, .{
+            .description = "the max number of search steps used by --preserve-alpha-coverage",
+            .long = "preserve-alpha-coverage-max-steps",
+            .default = .{ .value = 10 },
+        }),
+        NamedArg.init(?Image.ResizeOptions.Filter, .{
             .description = "defaults to the mitchell filter for LDR images, box for HDR images",
             .long = "filter",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.Filter, .{
+        NamedArg.init(?Image.ResizeOptions.Filter, .{
             .description = "overrides --filter in the U direction",
             .long = "filter-u",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.Filter, .{
+        NamedArg.init(?Image.ResizeOptions.Filter, .{
             .description = "overrides --filter in the V direction",
             .long = "filter-v",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.AddressMode, .{
+        NamedArg.init(?Image.ResizeOptions.AddressMode, .{
             .long = "address-mode",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.AddressMode, .{
+        NamedArg.init(?Image.ResizeOptions.AddressMode, .{
             .description = "overrides --address-mode in the U direction",
             .long = "address-mode-u",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.AddressMode, .{
+        NamedArg.init(?Image.ResizeOptions.AddressMode, .{
             .description = "overrides --address-mode in the V direction",
             .long = "address-mode-v",
             .default = .{ .value = null },
@@ -253,46 +260,6 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    const maybe_address_mode_u = args.named.@"address-mode-u" orelse args.named.@"address-mode";
-    const maybe_address_mode_v = args.named.@"address-mode-v" orelse args.named.@"address-mode";
-    const default_filter: Image.Filter = switch (encoding) {
-        .bc7, .@"rgba-u8" => .mitchell,
-        .@"rgba-f32" => .box,
-    };
-    const filter_u = args.named.@"filter-u" orelse args.named.filter orelse default_filter;
-    const filter_v = args.named.@"filter-v" orelse args.named.filter orelse default_filter;
-    if (filter_u == .box and maybe_address_mode_u != null and maybe_address_mode_u != .clamp) {
-        // Not supported by current STB, has no effect if set
-        log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
-        std.process.exit(1);
-    }
-    if (filter_v == .box and maybe_address_mode_v != null and maybe_address_mode_v != .clamp) {
-        // Not supported by current STB, has no effect if set
-        log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
-        std.process.exit(1);
-    }
-    switch (encoding) {
-        .bc7, .@"rgba-u8" => {},
-        .@"rgba-f32" => {
-            // Sharpening filters can cause extreme artifacts on HDR images. See #15 for more
-            // information.
-            if (filter_u.sharpens()) {
-                log.err(
-                    "{s}: {s} filter applies sharpening, is not compatible with HDR images",
-                    .{ args.positional.INPUT, @tagName(filter_u) },
-                );
-                std.process.exit(1);
-            }
-            if (filter_v.sharpens()) {
-                log.err(
-                    "{s}: {s} filter applies sharpening, is not compatible with HDR images",
-                    .{ args.positional.INPUT, @tagName(filter_v) },
-                );
-                std.process.exit(1);
-            }
-        },
-    }
-
     const cwd = std.fs.cwd();
 
     // Load the first level
@@ -308,22 +275,14 @@ pub fn main() !void {
     };
     defer allocator.free(input_bytes);
 
-    var raw_levels: std.BoundedArray(Image, Ktx2.max_levels) = .{};
-    defer for (raw_levels.constSlice()[1..]) |level| {
-        level.deinit();
-    };
-    const premultiply = args.named.@"alpha-input" == .straight and
-        args.named.@"alpha-output" == .premultiplied;
-    raw_levels.appendAssumeCapacity(Image.init(.{
+    const original = Image.init(.{
         .bytes = input_bytes,
-        .channels = .@"4",
-        .premultiply = premultiply,
-        .ty = switch (encoding) {
+        .color_space = switch (encoding) {
             inline .bc7, .@"rgba-u8" => |ec| switch (ec.named.@"color-space") {
-                .srgb => .u8_srgb,
-                .linear => .u8,
+                .srgb => .srgb,
+                .linear => .linear,
             },
-            .@"rgba-f32" => .f32,
+            .@"rgba-f32" => .hdr,
         },
     }) catch |err| switch (err) {
         error.StbImageFailure => {
@@ -334,12 +293,55 @@ pub fn main() !void {
             log.err("{s}: cannot store LDR input image as HDR format", .{args.positional.INPUT});
             std.process.exit(1);
         },
-    });
+    };
+    defer original.deinit();
 
-    // Scale the first level if requested
+    if (args.named.@"alpha-input" == .straight and args.named.@"alpha-output" == .premultiplied) {
+        original.premultiply();
+    }
+
+    const maybe_address_mode_u = args.named.@"address-mode-u" orelse args.named.@"address-mode";
+    const maybe_address_mode_v = args.named.@"address-mode-v" orelse args.named.@"address-mode";
+    const default_filter: Image.ResizeOptions.Filter = if (original.hdr) .box else .mitchell;
+    const filter_u = args.named.@"filter-u" orelse args.named.filter orelse default_filter;
+    const filter_v = args.named.@"filter-v" orelse args.named.filter orelse default_filter;
+    if (filter_u == .box and maybe_address_mode_u != null and maybe_address_mode_u != .clamp) {
+        // Not supported by current STB, has no effect if set
+        log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
+        std.process.exit(1);
+    }
+    if (filter_v == .box and maybe_address_mode_v != null and maybe_address_mode_v != .clamp) {
+        // Not supported by current STB, has no effect if set
+        log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
+        std.process.exit(1);
+    }
+
+    // Sharpening filters can cause extreme artifacts on HDR images. See #15 for more
+    // information.
+    if (original.hdr) {
+        if (filter_u.sharpens()) {
+            log.err(
+                "{s}: {s} filter applies sharpening, is not compatible with HDR images",
+                .{ args.positional.INPUT, @tagName(filter_u) },
+            );
+            std.process.exit(1);
+        }
+        if (filter_v.sharpens()) {
+            log.err(
+                "{s}: {s} filter applies sharpening, is not compatible with HDR images",
+                .{ args.positional.INPUT, @tagName(filter_v) },
+            );
+            std.process.exit(1);
+        }
+    }
+
+    // Copy the original image into the mip levels, scaling it if needed.
+    var raw_levels: std.BoundedArray(Image, Ktx2.max_levels) = .{};
+    defer for (raw_levels.constSlice()[1..]) |level| {
+        level.deinit();
+    };
     {
         // Read the scale parameters
-        var image = raw_levels.get(0);
         const maybe_max_width = args.named.@"max-width" orelse args.named.@"max-size";
         const maybe_max_height = args.named.@"max-height" orelse args.named.@"max-size";
 
@@ -348,8 +350,8 @@ pub fn main() !void {
             // If it was, validate the other input arguments, even if it turns out that the image
             // is already small enough (an artist resizing an input image shouldn't cause a
             // previously working bake step to start failing!)
-            const max_width = maybe_max_width orelse image.width;
-            const max_height = maybe_max_height orelse image.height;
+            const max_width = maybe_max_width orelse original.width;
+            const max_height = maybe_max_height orelse original.height;
             const address_mode_u = maybe_address_mode_u orelse {
                 log.err("{s}: address-mode not set", .{args.positional.INPUT});
                 std.process.exit(1);
@@ -360,26 +362,30 @@ pub fn main() !void {
             };
 
             // Perform the resize if one is necessary
-            if (max_width < image.width or max_height < image.height) {
-                const x_scale = @as(f64, @floatFromInt(max_width)) / @as(f64, @floatFromInt(image.width));
-                const y_scale = @as(f64, @floatFromInt(max_height)) / @as(f64, @floatFromInt(image.height));
-                const scale = @min(x_scale, y_scale);
-                const width = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(image.width)))), max_width);
-                const height = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(image.height)))), max_height);
-                const scaled = image.resize(.{
-                    .width = width,
-                    .height = height,
-                    .address_mode_u = address_mode_u,
-                    .address_mode_v = address_mode_v,
-                    .filter_u = filter_u,
-                    .filter_v = filter_v,
-                }) orelse {
-                    log.err("{s}: resize failed", .{args.positional.INPUT});
-                    std.process.exit(1);
-                };
-                raw_levels.pop().deinit();
-                raw_levels.appendAssumeCapacity(scaled);
-            }
+            const x_scale = @min(@as(f64, @floatFromInt(max_width)) / @as(f64, @floatFromInt(original.width)), 1.0);
+            const y_scale = @min(@as(f64, @floatFromInt(max_height)) / @as(f64, @floatFromInt(original.height)), 1.0);
+            const scale = @min(x_scale, y_scale);
+            const width = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(original.width)))), max_width);
+            const height = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(original.height)))), max_height);
+            const scaled = original.resize(.{
+                .width = width,
+                .height = height,
+                .address_mode_u = address_mode_u,
+                .address_mode_v = address_mode_v,
+                .filter_u = filter_u,
+                .filter_v = filter_v,
+            }) orelse {
+                log.err("{s}: resize failed", .{args.positional.INPUT});
+                std.process.exit(1);
+            };
+            raw_levels.appendAssumeCapacity(scaled);
+        } else {
+            // We can elide this copy if it ends up being a perf/memory issue, for now it's
+            // convenient since we may use it to calculate coverage later.
+            raw_levels.appendAssumeCapacity(original.copy() orelse {
+                log.err("{s}: out of memory", .{args.positional.INPUT});
+                std.process.exit(1);
+            });
         }
     }
 
@@ -396,25 +402,73 @@ pub fn main() !void {
 
         const block_size: u8 = switch (encoding) {
             .@"rgba-u8", .@"rgba-f32" => 1,
-            // We're allowed to go smaller than the block size, but there's no benefit to doing
-            // so
             .bc7 => 4,
         };
 
-        var image = raw_levels.get(0);
-        while (image.width > block_size or image.height > block_size) {
-            image = image.resize(.{
-                .width = @max(1, image.width / 2),
-                .height = @max(1, image.height / 2),
-                .address_mode_u = address_mode_u,
-                .address_mode_v = address_mode_v,
-                .filter_u = filter_u,
-                .filter_v = filter_v,
-            }) orelse {
-                log.err("{s}: mipmap generation failed", .{args.positional.INPUT});
-                std.process.exit(1);
-            };
-            raw_levels.appendAssumeCapacity(image);
+        var generate_mipmaps = raw_levels.get(0).generateMipmaps(.{
+            .address_mode_u = address_mode_u,
+            .address_mode_v = address_mode_v,
+            .filter_u = filter_u,
+            .filter_v = filter_v,
+            .block_size = block_size,
+        });
+
+        while (generate_mipmaps.next()) |mipmap| {
+            raw_levels.appendAssumeCapacity(mipmap);
+        }
+    }
+
+    // Cutout the textures if requested
+    if (args.named.@"preserve-alpha-coverage") |threshold_raw| {
+        // Check the threshold's range, and quantize it if necessary
+        if (threshold_raw < 0.0 or threshold_raw > 1.0) {
+            log.err("{s}: cutout threshold must be between 0 and 1 inclusive", .{args.positional.INPUT});
+            std.process.exit(1);
+        }
+        const threshold = switch (encoding) {
+            .@"rgba-u8", .bc7 => @round(threshold_raw * 255.0) / 255.0,
+            .@"rgba-f32" => threshold_raw,
+        };
+
+        // Determine the target coverage
+        const target_coverage = original.alphaCoverage(threshold, 1.0);
+
+        // Process each mip level. Technically we could skip the first level if no resizing was
+        // applied, for simplicity we don't do this right now.
+        for (raw_levels.constSlice()) |level| {
+            // Binary search for the best scale parameter
+            var best_scale: f32 = 1.0;
+            var best_dist = std.math.inf(f32);
+            var upper_threshold: f32 = 1.0;
+            var lower_threshold: f32 = 0.0;
+            var curr_threshold: f32 = threshold;
+            for (0..args.named.@"preserve-alpha-coverage-max-steps") |_| {
+                const curr_scale = threshold / curr_threshold;
+                const coverage = level.alphaCoverage(threshold, curr_scale);
+                const dist_to_coverage = @abs(coverage - target_coverage);
+                if (dist_to_coverage < best_dist) {
+                    best_dist = dist_to_coverage;
+                    best_scale = curr_scale;
+                }
+
+                if (coverage < target_coverage) {
+                    upper_threshold = curr_threshold;
+                } else if (coverage > target_coverage) {
+                    lower_threshold = curr_threshold;
+                } else {
+                    break;
+                }
+
+                curr_threshold = (lower_threshold + upper_threshold) / 2.0;
+            }
+
+            // Apply the scaling
+            if (best_scale != 1.0) {
+                for (0..@as(usize, level.width) * @as(usize, level.height)) |i| {
+                    const a = &level.data[i * 4 + 3];
+                    a.* = @min(a.* * best_scale, 1.0);
+                }
+            }
         }
     }
 
@@ -423,10 +477,30 @@ pub fn main() !void {
     defer for (bc7_encoders.constSlice()) |bc7_encoder| {
         bc7_encoder.deinit();
     };
+    var u8_encodings: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
+    defer for (u8_encodings.constSlice()) |u8_encoding| {
+        allocator.free(u8_encoding);
+    };
     var encoded_levels: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
     switch (encoding) {
-        .@"rgba-u8", .@"rgba-f32" => for (raw_levels.constSlice()) |raw_level| {
-            encoded_levels.appendAssumeCapacity(raw_level.data);
+        .@"rgba-u8" => |encoding_options| for (raw_levels.constSlice()) |raw_level| {
+            const encoded_level = allocator.alloc(u8, raw_level.data.len) catch {
+                log.err("{s}: out of memory", .{args.positional.INPUT});
+                std.process.exit(1);
+            };
+            for (0..@as(usize, raw_level.width) * @as(usize, raw_level.height) * 4) |i| {
+                var ldr = raw_level.data[i];
+                if (encoding_options.named.@"color-space" == .srgb and i % 4 != 3) {
+                    ldr = std.math.pow(f32, ldr, 1.0 / 2.2);
+                }
+                ldr = std.math.clamp(ldr * 255.0 + 0.5, 0.0, 255.0);
+                encoded_level[i] = @intFromFloat(ldr);
+            }
+            u8_encodings.appendAssumeCapacity(encoded_level);
+            encoded_levels.appendAssumeCapacity(encoded_level);
+        },
+        .@"rgba-f32" => for (raw_levels.constSlice()) |raw_level| {
+            encoded_levels.appendAssumeCapacity(std.mem.sliceAsBytes(raw_level.data));
         },
         .bc7 => |bc7| {
             // Determine the bc7 params
@@ -445,7 +519,8 @@ pub fn main() !void {
                     std.process.exit(1);
                 }
                 params.max_partitions_to_scan = bc7.named.@"max-partitions-to-scan";
-                // Ignored when using RDO (fine to set regardless, is cleared upstream)
+                // Ignored when using RDO. However, we use it in our bindings. The actual encoder
+                // just clears it so it doesn't matter that we set it regardless.
                 params.perceptual = bc7.named.@"color-space" == .srgb;
                 params.mode6_only = bc7.named.@"mode-6-only";
 
@@ -516,7 +591,12 @@ pub fn main() !void {
 
                 const bc7_encoder = bc7_encoders.get(bc7_encoders.len - 1);
 
-                if (!bc7_encoder.encode(&params, raw_level.width, raw_level.height, raw_level.data.ptr)) {
+                if (!bc7_encoder.encode(
+                    &params,
+                    raw_level.width,
+                    raw_level.height,
+                    raw_level.data.ptr,
+                )) {
                     log.err("{s}: encoder failed", .{args.positional.INPUT});
                     std.process.exit(1);
                 }
@@ -623,11 +703,11 @@ pub fn main() !void {
     {
         // Calculate the byte offsets, taking into account that KTX2 requires mipmaps be stored from
         // largest to smallest for streaming purposes
-        var byte_offsets_reverse: std.BoundedArray(u64, Ktx2.max_levels) = .{};
+        var byte_offsets_reverse: std.BoundedArray(usize, Ktx2.max_levels) = .{};
         {
-            var byte_offset: u64 = index.dfd_byte_offset + index.dfd_byte_length;
+            var byte_offset: usize = index.dfd_byte_offset + index.dfd_byte_length;
             for (0..compressed_levels.len) |i| {
-                byte_offset = std.mem.alignForward(u64, byte_offset, level_alignment);
+                byte_offset = std.mem.alignForward(usize, byte_offset, level_alignment);
                 const compressed_level = compressed_levels.get(compressed_levels.len - i - 1);
                 byte_offsets_reverse.appendAssumeCapacity(byte_offset);
                 byte_offset += compressed_level.len;
@@ -765,10 +845,10 @@ pub fn main() !void {
     // Write the compressed data. Note that KTX2 requires mips be stored form smallest to largest
     // for streaming purposes.
     {
-        var byte_offset: u64 = index.dfd_byte_offset + index.dfd_byte_length;
+        var byte_offset: usize = index.dfd_byte_offset + index.dfd_byte_length;
         for (0..compressed_levels.len) |i| {
             // Write padding
-            const padded = std.mem.alignForward(u64, byte_offset, level_alignment);
+            const padded = std.mem.alignForward(usize, byte_offset, level_alignment);
             writer.writeByteNTimes(0, padded - byte_offset) catch |err| {
                 log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
                 std.process.exit(1);
@@ -875,214 +955,8 @@ const Bc7Enc = opaque {
         params: *const Params,
         width: u32,
         height: u32,
-        pixels: [*]const u8,
+        pixels: [*]const f32,
     ) callconv(.C) bool;
     extern fn bc7enc_getBlocks(self: *@This()) callconv(.C) [*]u8;
     extern fn bc7enc_getTotalBlocksSizeInBytes(self: *@This()) callconv(.C) u32;
-};
-
-pub const Image = struct {
-    width: u32,
-    height: u32,
-    ty: DataType,
-    channels: Channels,
-    data: []u8,
-
-    pub const Channels = enum(u3) {
-        @"1" = 1,
-        @"2" = 2,
-        @"3" = 3,
-        @"4" = 4,
-    };
-
-    pub const DataType = enum(c_uint) {
-        u8 = c.STBIR_TYPE_UINT8,
-        u8_srgb = c.STBIR_TYPE_UINT8_SRGB,
-        // "alpha channel, when present, should also be SRGB (this is very unusual)"
-        u8_srgb_alpha = c.STBIR_TYPE_UINT8_SRGB_ALPHA,
-        u16 = c.STBIR_TYPE_UINT16,
-        f32 = c.STBIR_TYPE_FLOAT,
-        f16 = c.STBIR_TYPE_HALF_FLOAT,
-
-        pub fn bytesPerChannel(self: @This()) u8 {
-            return switch (self) {
-                .u8, .u8_srgb, .u8_srgb_alpha => 1,
-                .u16 => 2,
-                .f32 => 4,
-                .f16 => 2,
-            };
-        }
-    };
-    pub const AddressMode = enum(c_uint) {
-        clamp = c.STBIR_EDGE_CLAMP,
-        reflect = c.STBIR_EDGE_REFLECT,
-        wrap = c.STBIR_EDGE_WRAP,
-        zero = c.STBIR_EDGE_ZERO,
-    };
-    pub const Filter = enum(c_uint) {
-        box = c.STBIR_FILTER_BOX,
-        triangle = c.STBIR_FILTER_TRIANGLE,
-        @"cubic-b-spline" = c.STBIR_FILTER_CUBICBSPLINE,
-        @"catmull-rom" = c.STBIR_FILTER_CATMULLROM,
-        mitchell = c.STBIR_FILTER_MITCHELL,
-        @"point-sample" = c.STBIR_FILTER_POINT_SAMPLE,
-
-        pub fn sharpens(self: @This()) bool {
-            return switch (self) {
-                .box, .triangle, .@"point-sample", .@"cubic-b-spline" => false,
-                .mitchell, .@"catmull-rom" => true,
-            };
-        }
-    };
-
-    pub const Error = error{
-        StbImageFailure,
-        LdrAsHdr,
-    };
-
-    pub const InitOptions = struct {
-        bytes: []const u8,
-        ty: DataType,
-        channels: Channels,
-        premultiply: bool,
-    };
-    pub fn init(options: InitOptions) Error!@This() {
-        switch (options.ty) {
-            .u8, .u8_srgb, .u8_srgb_alpha => {
-                var width: c_int = 0;
-                var height: c_int = 0;
-                var input_channels: c_int = 0;
-                const data = c.stbi_load_from_memory(
-                    options.bytes.ptr,
-                    @intCast(options.bytes.len),
-                    &width,
-                    &height,
-                    &input_channels,
-                    @intFromEnum(options.channels),
-                ) orelse return error.StbImageFailure;
-
-                const len = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * @intFromEnum(options.channels);
-                const image: @This() = .{
-                    .width = @intCast(width),
-                    .height = @intCast(height),
-                    .channels = options.channels,
-                    .ty = options.ty,
-                    .data = data[0..len],
-                };
-
-                if (options.premultiply) {
-                    var px: usize = 0;
-                    while (px < image.width * image.height * 4) : (px += 4) {
-                        const a: f32 = @as(f32, @floatFromInt(image.data[px + 3])) / 255.0;
-                        image.data[px + 0] = @intFromFloat(@as(f32, @floatFromInt(image.data[px + 0])) * a);
-                        image.data[px + 1] = @intFromFloat(@as(f32, @floatFromInt(image.data[px + 1])) * a);
-                        image.data[px + 2] = @intFromFloat(@as(f32, @floatFromInt(image.data[px + 2])) * a);
-                    }
-                }
-
-                return image;
-            },
-            .f32 => {
-                if (c.stbi_is_hdr_from_memory(options.bytes.ptr, @intCast(options.bytes.len)) == 0) {
-                    return error.LdrAsHdr;
-                }
-
-                var width: c_int = 0;
-                var height: c_int = 0;
-                var input_channels: c_int = 0;
-                const data_ptr = c.stbi_loadf_from_memory(
-                    options.bytes.ptr,
-                    @intCast(options.bytes.len),
-                    &width,
-                    &height,
-                    &input_channels,
-                    @intFromEnum(options.channels),
-                ) orelse return error.StbImageFailure;
-
-                const len = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * @intFromEnum(options.channels);
-                const data = data_ptr[0..len];
-                const image: @This() = .{
-                    .width = @intCast(width),
-                    .height = @intCast(height),
-                    .channels = options.channels,
-                    .ty = options.ty,
-                    .data = std.mem.sliceAsBytes(data),
-                };
-
-                if (options.premultiply) {
-                    var px: usize = 0;
-                    while (px < image.width * image.height * 4) : (px += 4) {
-                        const a = data[px + 3];
-                        data[px + 0] = data[px + 0] * a;
-                        data[px + 1] = data[px + 1] * a;
-                        data[px + 2] = data[px + 2] * a;
-                    }
-                }
-
-                return image;
-            },
-            else => std.debug.panic("unsupported data type {}", .{options.ty}),
-        }
-    }
-
-    pub fn deinit(self: @This()) void {
-        c.stbi_image_free(self.data.ptr);
-    }
-
-    pub const ResizeOptions = struct {
-        width: u32,
-        height: u32,
-        address_mode_u: AddressMode,
-        address_mode_v: AddressMode,
-        filter_u: Filter,
-        filter_v: Filter,
-    };
-
-    pub fn resize(self: @This(), options: ResizeOptions) ?Image {
-        if (options.width == 0 or options.height == 0) return null;
-
-        const input_stride = self.width * self.ty.bytesPerChannel() * @intFromEnum(self.channels);
-        const output_stride = options.width * self.ty.bytesPerChannel() * @intFromEnum(self.channels);
-        const output_size = options.height * output_stride;
-        const data: [*]u8 = @ptrCast(std.c.malloc(output_size) orelse return null);
-
-        var stbr_options: c.STBIR_RESIZE = undefined;
-        c.stbir_resize_init(
-            &stbr_options,
-            self.data.ptr,
-            @intCast(self.width),
-            @intCast(self.height),
-            @intCast(input_stride),
-            data,
-            @intCast(options.width),
-            @intCast(options.height),
-            @intCast(output_stride),
-            switch (self.channels) {
-                .@"1" => c.STBIR_1CHANNEL,
-                .@"2" => c.STBIR_2CHANNEL,
-                .@"3" => c.STBIR_RGB,
-                // We always premultiply alpha channels ourselves if they represent transparency
-                .@"4" => c.STBIR_RGBA_PM,
-            },
-            @intFromEnum(self.ty),
-        );
-
-        stbr_options.horizontal_edge = @intFromEnum(options.address_mode_u);
-        stbr_options.vertical_edge = @intFromEnum(options.address_mode_v);
-        stbr_options.horizontal_filter = @intFromEnum(options.filter_u);
-        stbr_options.vertical_filter = @intFromEnum(options.filter_v);
-
-        if (c.stbir_resize_extended(&stbr_options) != 1) {
-            std.c.free(data);
-            return null;
-        }
-
-        return .{
-            .width = options.width,
-            .height = options.height,
-            .channels = self.channels,
-            .ty = self.ty,
-            .data = data[0..output_size],
-        };
-    }
 };
