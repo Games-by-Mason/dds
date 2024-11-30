@@ -7,6 +7,7 @@ const Image = @This();
 width: u32,
 height: u32,
 data: []f32,
+hdr: bool,
 
 pub const InitError = error{
     StbImageFailure,
@@ -25,13 +26,16 @@ pub const InitOptions = struct {
 };
 
 pub fn init(options: InitOptions) InitError!Image {
-    // Don't allow upsampling LDR to HDR.
+    // Check if the input is HDR
+    const hdr = c.stbi_is_hdr_from_memory(
+        options.bytes.ptr,
+        @intCast(options.bytes.len),
+    ) == 1;
+
+    // Don't allow upsampling LDR to HDR
     switch (options.color_space) {
         .linear, .srgb => {},
-        .hdr => if (c.stbi_is_hdr_from_memory(
-            options.bytes.ptr,
-            @intCast(options.bytes.len),
-        ) == 0) return error.LdrAsHdr,
+        .hdr => if (!hdr) return error.LdrAsHdr,
     }
 
     // All images are loaded as linear floats regardless of the source and dest formats.
@@ -65,6 +69,7 @@ pub fn init(options: InitOptions) InitError!Image {
         .width = @intCast(width),
         .height = @intCast(height),
         .data = data_ptr[0..data_len],
+        .hdr = hdr,
     };
 }
 
@@ -92,6 +97,7 @@ pub fn copy(self: Image) ?Image {
         .width = self.width,
         .height = self.height,
         .data = data,
+        .hdr = self.hdr,
     };
 }
 
@@ -134,9 +140,10 @@ pub fn resize(self: Image, options: ResizeOptions) ?Image {
     const input_stride = @as(usize, self.width) * @sizeOf(f32) * 4;
     const output_stride = @as(usize, options.width) * @sizeOf(f32) * 4;
     const output_size = @as(usize, options.height) * output_stride;
-    const data: [*]f32 = @ptrCast(@alignCast(c.malloc(
+    const data_ptr: [*]f32 = @ptrCast(@alignCast(c.malloc(
         output_size,
     ) orelse return null));
+    const data = data_ptr[0 .. output_size / @sizeOf(f32)];
 
     var stbr_options: c.STBIR_RESIZE = undefined;
     c.stbir_resize_init(
@@ -145,7 +152,7 @@ pub fn resize(self: Image, options: ResizeOptions) ?Image {
         @intCast(self.width),
         @intCast(self.height),
         @intCast(input_stride),
-        data,
+        data.ptr,
         @intCast(options.width),
         @intCast(options.height),
         @intCast(output_stride),
@@ -160,14 +167,22 @@ pub fn resize(self: Image, options: ResizeOptions) ?Image {
     stbr_options.vertical_filter = @intFromEnum(options.filter_v);
 
     if (c.stbir_resize_extended(&stbr_options) != 1) {
-        c.free(data);
+        c.free(data.ptr);
         return null;
+    }
+
+    // Sharpening filters can push values below zero. Clamp them before doing further processing.
+    if (options.filter_u.sharpens() or options.filter_v.sharpens()) {
+        for (data) |*d| {
+            d.* = @max(d.*, 0.0);
+        }
     }
 
     return .{
         .width = options.width,
         .height = options.height,
-        .data = data[0 .. output_size / @sizeOf(f32)],
+        .data = data,
+        .hdr = self.hdr,
     };
 }
 

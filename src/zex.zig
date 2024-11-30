@@ -66,8 +66,8 @@ const command: Command = .{
             .default = .{ .value = false },
         }),
         NamedArg.init(?f32, .{
-            .description = "outputs a cutout texture with the given threshold, preserves alpha coverage when sampling",
-            .long = "cutout",
+            .description = "preserves alpha coverage for the given alpha test threshold, slower but significantly improves mipmapping of cutouts and alpha to coverage textures",
+            .long = "preserve-alpha-coverage",
             .default = .{ .value = null },
         }),
         NamedArg.init(?Image.ResizeOptions.Filter, .{
@@ -255,11 +255,6 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    if (args.named.@"alpha-input" == .premultiplied and args.named.cutout != null) {
-        log.err("cutout texture inputs must have straight alpha", .{});
-        std.process.exit(1);
-    }
-
     const maybe_address_mode_u = args.named.@"address-mode-u" orelse args.named.@"address-mode";
     const maybe_address_mode_v = args.named.@"address-mode-v" orelse args.named.@"address-mode";
     const default_filter: Image.ResizeOptions.Filter = switch (encoding) {
@@ -277,27 +272,6 @@ pub fn main() !void {
         // Not supported by current STB, has no effect if set
         log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
         std.process.exit(1);
-    }
-    switch (encoding) {
-        .bc7, .@"rgba-u8" => {},
-        .@"rgba-f32" => {
-            // Sharpening filters can cause extreme artifacts on HDR images. See #15 for more
-            // information.
-            if (filter_u.sharpens()) {
-                log.err(
-                    "{s}: {s} filter applies sharpening, is not compatible with HDR images",
-                    .{ args.positional.INPUT, @tagName(filter_u) },
-                );
-                std.process.exit(1);
-            }
-            if (filter_v.sharpens()) {
-                log.err(
-                    "{s}: {s} filter applies sharpening, is not compatible with HDR images",
-                    .{ args.positional.INPUT, @tagName(filter_v) },
-                );
-                std.process.exit(1);
-            }
-        },
     }
 
     const cwd = std.fs.cwd();
@@ -338,6 +312,25 @@ pub fn main() !void {
 
     if (args.named.@"alpha-input" == .straight and args.named.@"alpha-output" == .premultiplied) {
         original.premultiply();
+    }
+
+    // Sharpening filters can cause extreme artifacts on HDR images. See #15 for more
+    // information.
+    if (original.hdr) {
+        if (filter_u.sharpens()) {
+            log.err(
+                "{s}: {s} filter applies sharpening, is not compatible with HDR images",
+                .{ args.positional.INPUT, @tagName(filter_u) },
+            );
+            std.process.exit(1);
+        }
+        if (filter_v.sharpens()) {
+            log.err(
+                "{s}: {s} filter applies sharpening, is not compatible with HDR images",
+                .{ args.positional.INPUT, @tagName(filter_v) },
+            );
+            std.process.exit(1);
+        }
     }
 
     // Copy the original image into the mip levels, scaling it if needed.
@@ -415,13 +408,14 @@ pub fn main() !void {
             .filter_v = filter_v,
             .block_size = block_size,
         });
+
         while (generate_mipmaps.next()) |mipmap| {
             raw_levels.appendAssumeCapacity(mipmap);
         }
     }
 
     // Cutout the textures if requested
-    if (args.named.cutout) |threshold_raw| {
+    if (args.named.@"preserve-alpha-coverage") |threshold_raw| {
         // Check the threshold's range, and quantize it if necessary
         if (threshold_raw < 0.0 or threshold_raw > 1.0) {
             log.err("{s}: cutout threshold must be between 0 and 1 inclusive", .{args.positional.INPUT});
@@ -437,7 +431,7 @@ pub fn main() !void {
 
         // Process each mip level
         for (raw_levels.constSlice(), 0..) |level, level_i| {
-            // Binary search for the best parameters
+            // Binary search for the best scale parameter
             var best_scale: f32 = 1.0;
             if (level_i > 0) {
                 var best_dist = std.math.inf(f32);
@@ -462,10 +456,9 @@ pub fn main() !void {
                 }
             }
 
-            // Apply the scaling and cutout the image
             for (0..@as(usize, level.width) * @as(usize, level.height)) |i| {
-                const alpha = &level.data[i * 4 + 3];
-                alpha.* = if (alpha.* * best_scale <= threshold) 0.0 else 1.0;
+                const a = &level.data[i * 4 + 3];
+                a.* = @min(a.* * best_scale, 1.0);
             }
         }
     }
