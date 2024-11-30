@@ -6,9 +6,6 @@
 #include "stb_image.h"
 
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
-#define STBIR_SSE2
-#define STBIR_AVX
-#define STBIR_AVX2
 #define STBIR_USE_FMA
 #include "stb_image_resize2.h"
 

@@ -137,13 +137,11 @@ pub fn resize(self: Image, options: ResizeOptions) ?Image {
     if (options.width == 0 or options.height == 0) return null;
     if (options.width == self.width and options.height == self.height) return self.copy();
 
-    const input_stride = @as(usize, self.width) * @sizeOf(f32) * 4;
-    const output_stride = @as(usize, options.width) * @sizeOf(f32) * 4;
-    const output_size = @as(usize, options.height) * output_stride;
+    const output_samples = @as(usize, options.width) * @as(usize, options.height) * 4;
     const data_ptr: [*]f32 = @ptrCast(@alignCast(c.malloc(
-        output_size,
+        output_samples * @sizeOf(f32),
     ) orelse return null));
-    const data = data_ptr[0 .. output_size / @sizeOf(f32)];
+    const data = data_ptr[0..output_samples];
 
     var stbr_options: c.STBIR_RESIZE = undefined;
     c.stbir_resize_init(
@@ -151,11 +149,11 @@ pub fn resize(self: Image, options: ResizeOptions) ?Image {
         self.data.ptr,
         @intCast(self.width),
         @intCast(self.height),
-        @intCast(input_stride),
+        0,
         data.ptr,
         @intCast(options.width),
         @intCast(options.height),
-        @intCast(output_stride),
+        0,
         // We always premultiply alpha channels ourselves if they represent transparency
         c.STBIR_RGBA_PM,
         c.STBIR_TYPE_FLOAT,
@@ -172,6 +170,7 @@ pub fn resize(self: Image, options: ResizeOptions) ?Image {
     }
 
     // Sharpening filters can push values below zero. Clamp them before doing further processing.
+    // We could alternatively use `STBIR_FLOAT_LOW_CLAMP`, see issue #18.
     if (options.filter_u.sharpens() or options.filter_v.sharpens()) {
         for (data) |*d| {
             d.* = @max(d.*, 0.0);

@@ -255,25 +255,6 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    const maybe_address_mode_u = args.named.@"address-mode-u" orelse args.named.@"address-mode";
-    const maybe_address_mode_v = args.named.@"address-mode-v" orelse args.named.@"address-mode";
-    const default_filter: Image.ResizeOptions.Filter = switch (encoding) {
-        .bc7, .@"rgba-u8" => .mitchell,
-        .@"rgba-f32" => .box,
-    };
-    const filter_u = args.named.@"filter-u" orelse args.named.filter orelse default_filter;
-    const filter_v = args.named.@"filter-v" orelse args.named.filter orelse default_filter;
-    if (filter_u == .box and maybe_address_mode_u != null and maybe_address_mode_u != .clamp) {
-        // Not supported by current STB, has no effect if set
-        log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
-        std.process.exit(1);
-    }
-    if (filter_v == .box and maybe_address_mode_v != null and maybe_address_mode_v != .clamp) {
-        // Not supported by current STB, has no effect if set
-        log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
-        std.process.exit(1);
-    }
-
     const cwd = std.fs.cwd();
 
     // Load the first level
@@ -312,6 +293,22 @@ pub fn main() !void {
 
     if (args.named.@"alpha-input" == .straight and args.named.@"alpha-output" == .premultiplied) {
         original.premultiply();
+    }
+
+    const maybe_address_mode_u = args.named.@"address-mode-u" orelse args.named.@"address-mode";
+    const maybe_address_mode_v = args.named.@"address-mode-v" orelse args.named.@"address-mode";
+    const default_filter: Image.ResizeOptions.Filter = if (original.hdr) .box else .mitchell;
+    const filter_u = args.named.@"filter-u" orelse args.named.filter orelse default_filter;
+    const filter_v = args.named.@"filter-v" orelse args.named.filter orelse default_filter;
+    if (filter_u == .box and maybe_address_mode_u != null and maybe_address_mode_u != .clamp) {
+        // Not supported by current STB, has no effect if set
+        log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
+        std.process.exit(1);
+    }
+    if (filter_v == .box and maybe_address_mode_v != null and maybe_address_mode_v != .clamp) {
+        // Not supported by current STB, has no effect if set
+        log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
+        std.process.exit(1);
     }
 
     // Sharpening filters can cause extreme artifacts on HDR images. See #15 for more
@@ -449,9 +446,12 @@ pub fn main() !void {
 
                     if (coverage < target_coverage) {
                         upper_threshold = curr_threshold;
-                    } else {
+                    } else if (coverage > target_coverage) {
                         lower_threshold = curr_threshold;
+                    } else {
+                        break;
                     }
+
                     curr_threshold = (lower_threshold + upper_threshold) / 2.0;
                 }
             }
