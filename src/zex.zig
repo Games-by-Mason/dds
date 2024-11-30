@@ -70,6 +70,11 @@ const command: Command = .{
             .long = "preserve-alpha-coverage",
             .default = .{ .value = null },
         }),
+        NamedArg.init(u8, .{
+            .description = "the max number of search steps used by --preserve-alpha-coverage",
+            .long = "preserve-alpha-coverage-max-steps",
+            .default = .{ .value = 10 },
+        }),
         NamedArg.init(?Image.ResizeOptions.Filter, .{
             .description = "defaults to the mitchell filter for LDR images, box for HDR images",
             .long = "filter",
@@ -375,6 +380,8 @@ pub fn main() !void {
             };
             raw_levels.appendAssumeCapacity(scaled);
         } else {
+            // We can elide this copy if it ends up being a perf/memory issue, for now it's
+            // convenient since we may use it to calculate coverage later.
             raw_levels.appendAssumeCapacity(original.copy() orelse {
                 log.err("{s}: out of memory", .{args.positional.INPUT});
                 std.process.exit(1);
@@ -426,39 +433,41 @@ pub fn main() !void {
         // Determine the target coverage
         const target_coverage = original.alphaCoverage(threshold, 1.0);
 
-        // Process each mip level
-        for (raw_levels.constSlice(), 0..) |level, level_i| {
+        // Process each mip level. Technically we could skip the first level if no resizing was
+        // applied, for simplicity we don't do this right now.
+        for (raw_levels.constSlice()) |level| {
             // Binary search for the best scale parameter
             var best_scale: f32 = 1.0;
-            if (level_i > 0) {
-                var best_dist = std.math.inf(f32);
-                var upper_threshold: f32 = 1.0;
-                var lower_threshold: f32 = 0.0;
-                var curr_threshold: f32 = threshold;
-                for (0..10) |_| {
-                    const curr_scale = threshold / curr_threshold;
-                    const coverage = level.alphaCoverage(threshold, curr_scale);
-                    const dist_to_coverage = @abs(coverage - target_coverage);
-                    if (dist_to_coverage < best_dist) {
-                        best_dist = dist_to_coverage;
-                        best_scale = curr_scale;
-                    }
-
-                    if (coverage < target_coverage) {
-                        upper_threshold = curr_threshold;
-                    } else if (coverage > target_coverage) {
-                        lower_threshold = curr_threshold;
-                    } else {
-                        break;
-                    }
-
-                    curr_threshold = (lower_threshold + upper_threshold) / 2.0;
+            var best_dist = std.math.inf(f32);
+            var upper_threshold: f32 = 1.0;
+            var lower_threshold: f32 = 0.0;
+            var curr_threshold: f32 = threshold;
+            for (0..args.named.@"preserve-alpha-coverage-max-steps") |_| {
+                const curr_scale = threshold / curr_threshold;
+                const coverage = level.alphaCoverage(threshold, curr_scale);
+                const dist_to_coverage = @abs(coverage - target_coverage);
+                if (dist_to_coverage < best_dist) {
+                    best_dist = dist_to_coverage;
+                    best_scale = curr_scale;
                 }
+
+                if (coverage < target_coverage) {
+                    upper_threshold = curr_threshold;
+                } else if (coverage > target_coverage) {
+                    lower_threshold = curr_threshold;
+                } else {
+                    break;
+                }
+
+                curr_threshold = (lower_threshold + upper_threshold) / 2.0;
             }
 
-            for (0..@as(usize, level.width) * @as(usize, level.height)) |i| {
-                const a = &level.data[i * 4 + 3];
-                a.* = @min(a.* * best_scale, 1.0);
+            // Apply the scaling
+            if (best_scale != 1.0) {
+                for (0..@as(usize, level.width) * @as(usize, level.height)) |i| {
+                    const a = &level.data[i * 4 + 3];
+                    a.* = @min(a.* * best_scale, 1.0);
+                }
             }
         }
     }
