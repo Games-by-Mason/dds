@@ -8,11 +8,16 @@
 //! can't trivially use a Zig allocator here since STB's free function isn't given a length.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const log = std.log;
 const c = @import("c.zig");
 
 const Image = @This();
 
+const max_file_len = 4294967296;
+
+// XXX: store address mode here? reflect in ktx somehow even just as extra metadata in
+// key value pairs? we could also store things like cutout threshold. idk.
 width: u32,
 height: u32,
 data: []f32,
@@ -21,35 +26,38 @@ hdr: bool,
 pub const InitError = error{
     /// STB failed to parse the image.
     StbImageFailure,
-    /// An LDR image was loaded with an HDR color space.
-    LdrAsHdr,
+    /// The image's color space did not match.
+    WrongColorSpace,
 };
 
-pub const InitOptions = struct {
-    pub const ColorSpace = enum(c_uint) {
-        linear,
-        srgb,
-        hdr,
-    };
-
-    /// The image data.
-    bytes: []const u8,
-    /// The color space of the source image.
-    color_space: @This().ColorSpace,
+pub const ColorSpace = enum(c_uint) {
+    linear,
+    srgb,
+    hdr,
 };
 
-/// Initialize an image with `stb_image.h`.
-pub fn init(options: InitOptions) InitError!Image {
+/// Read an image using `stb_image.h`.
+pub fn read(
+    gpa: std.mem.Allocator,
+    reader: anytype,
+    color_space: ColorSpace,
+) (@TypeOf(reader).Error || error{ StreamTooLong, OutOfMemory } || InitError)!Image {
+    // XXX: ...in either case, do we want a buffered reader?
+    // We could pass the reader into STB for additional pipelining and reduced allocations. For
+    // simplicity's sake we don't do this yet, but we keep our options open by taking a reader.
+    const input_bytes = try reader.readAllAlloc(gpa, max_file_len);
+    defer gpa.free(input_bytes);
+
     // Check if the input is HDR
     const hdr = c.stbi_is_hdr_from_memory(
-        options.bytes.ptr,
-        @intCast(options.bytes.len),
+        input_bytes.ptr,
+        @intCast(input_bytes.len),
     ) == 1;
 
-    // Don't allow upsampling LDR to HDR
-    switch (options.color_space) {
-        .linear, .srgb => {},
-        .hdr => if (!hdr) return error.LdrAsHdr,
+    // Check that our color space matches up with the source image.
+    switch (color_space) {
+        .linear, .srgb => if (hdr) return error.WrongColorSpace,
+        .hdr => if (!hdr) return error.WrongColorSpace,
     }
 
     // We're gonna do our own premul, and STB doesn't expose whether it was already done or not.
@@ -66,7 +74,7 @@ pub fn init(options: InitOptions) InitError!Image {
     //
     // There's no technical benefit in the case where no processing is done, but this is not the
     // common case.
-    c.stbi_ldr_to_hdr_gamma(switch (options.color_space) {
+    c.stbi_ldr_to_hdr_gamma(switch (color_space) {
         .srgb => 2.2,
         .linear, .hdr => 1.0,
     });
@@ -76,8 +84,8 @@ pub fn init(options: InitOptions) InitError!Image {
     var height: c_int = 0;
     var input_channels: c_int = 0;
     const data_ptr = c.stbi_loadf_from_memory(
-        options.bytes.ptr,
-        @intCast(options.bytes.len),
+        input_bytes.ptr,
+        @intCast(input_bytes.len),
         &width,
         &height,
         &input_channels,
@@ -122,32 +130,33 @@ pub fn copy(self: Image) error{OutOfMemory}!Image {
     };
 }
 
+pub const AddressMode = enum(c_uint) {
+    clamp = c.STBIR_EDGE_CLAMP,
+    reflect = c.STBIR_EDGE_REFLECT,
+    wrap = c.STBIR_EDGE_WRAP,
+    zero = c.STBIR_EDGE_ZERO,
+};
+
+pub const Filter = enum(c_uint) {
+    // XXX: link to issue 20
+    // box = c.STBIR_FILTER_BOX,
+    triangle = c.STBIR_FILTER_TRIANGLE,
+    cubic_b_spline = c.STBIR_FILTER_CUBICBSPLINE,
+    catmull_rom = c.STBIR_FILTER_CATMULLROM,
+    mitchell = c.STBIR_FILTER_MITCHELL,
+    point_sample = c.STBIR_FILTER_POINT_SAMPLE,
+
+    pub fn sharpens(self: @This()) bool {
+        return switch (self) {
+            .triangle, .point_sample, .cubic_b_spline => false,
+            .mitchell, .catmull_rom => true,
+        };
+    }
+};
+
 pub const ResizeError = error{ StbResizeFailure, OutOfMemory };
 
 pub const ResizeOptions = struct {
-    pub const AddressMode = enum(c_uint) {
-        clamp = c.STBIR_EDGE_CLAMP,
-        reflect = c.STBIR_EDGE_REFLECT,
-        wrap = c.STBIR_EDGE_WRAP,
-        zero = c.STBIR_EDGE_ZERO,
-    };
-
-    pub const Filter = enum(c_uint) {
-        box = c.STBIR_FILTER_BOX,
-        triangle = c.STBIR_FILTER_TRIANGLE,
-        cubic_b_spline = c.STBIR_FILTER_CUBICBSPLINE,
-        catmull_rom = c.STBIR_FILTER_CATMULLROM,
-        mitchell = c.STBIR_FILTER_MITCHELL,
-        point_sample = c.STBIR_FILTER_POINT_SAMPLE,
-
-        pub fn sharpens(self: @This()) bool {
-            return switch (self) {
-                .box, .triangle, .point_sample, .cubic_b_spline => false,
-                .mitchell, .catmull_rom => true,
-            };
-        }
-    };
-
     width: u32,
     height: u32,
     address_mode_u: AddressMode,
@@ -157,12 +166,7 @@ pub const ResizeOptions = struct {
 };
 
 pub fn resize(self: Image, options: ResizeOptions) ResizeError!Image {
-    if (options.width == 0 or options.height == 0) return .{
-        .width = 0,
-        .height = 0,
-        .data = &.{},
-        .hdr = self.hdr,
-    };
+    assert(options.width > 0 and options.height > 0);
 
     if (options.width == self.width and options.height == self.height) return self.copy();
 
@@ -214,12 +218,49 @@ pub fn resize(self: Image, options: ResizeOptions) ResizeError!Image {
     };
 }
 
+pub const ResizeToFitOptions = struct {
+    max_size: u32 = std.math.maxInt(u32),
+    max_width: u32 = std.math.maxInt(u32),
+    max_height: u32 = std.math.maxInt(u32),
+    address_mode_u: AddressMode,
+    address_mode_v: AddressMode,
+    filter_u: Filter,
+    filter_v: Filter,
+};
+
+pub fn resizeToFit(self: Image, options: ResizeToFitOptions) ResizeError!Image {
+    const self_width_f: f64 = @floatFromInt(self.width);
+    const self_height_f: f64 = @floatFromInt(self.height);
+
+    const max_width: u32 = @min(options.max_width, options.max_size, self.width);
+    const max_height: u32 = @min(options.max_height, options.max_size, self.height);
+
+    const max_width_f: f64 = @floatFromInt(max_width);
+    const max_height_f: f64 = @floatFromInt(max_height);
+
+    const x_scale = @min(max_width_f / self_width_f, 1.0);
+    const y_scale = @min(max_height_f / self_height_f, 1.0);
+
+    const scale = @min(x_scale, y_scale);
+    const width = @min(@as(u32, @intFromFloat(scale * self_width_f)), max_width);
+    const height = @min(@as(u32, @intFromFloat(scale * self_height_f)), max_height);
+
+    return self.resize(.{
+        .width = width,
+        .height = height,
+        .address_mode_u = options.address_mode_u,
+        .address_mode_v = options.address_mode_v,
+        .filter_u = options.filter_u,
+        .filter_v = options.filter_v,
+    });
+}
+
 pub const GenerateMipMapsOptions = struct {
     block_size: u8,
-    address_mode_u: ResizeOptions.AddressMode,
-    address_mode_v: ResizeOptions.AddressMode,
-    filter_u: ResizeOptions.Filter,
-    filter_v: ResizeOptions.Filter,
+    address_mode_u: AddressMode,
+    address_mode_v: AddressMode,
+    filter_u: Filter,
+    filter_v: Filter,
 };
 
 pub fn generateMipmaps(self: Image, options: GenerateMipMapsOptions) GenerateMipmaps {
@@ -255,11 +296,59 @@ pub const GenerateMipmaps = struct {
 };
 
 pub fn alphaCoverage(self: Image, threshold: f32, scale: f32) f32 {
+    // Quantize the threshold to the output type
+    const quantized_threshold = if (self.hdr) threshold else @round(threshold * 255.0) / 255.0;
+
+    // Calculate the coverage
     var coverage: f32 = 0;
     for (0..@as(usize, self.width) * @as(usize, self.height)) |i| {
         const alpha = self.data[i * 4 + 3];
-        if (alpha * scale > threshold) coverage += 1.0;
+        if (alpha * scale > quantized_threshold) coverage += 1.0;
     }
     coverage /= @floatFromInt(@as(usize, self.width) * @as(usize, self.height));
     return coverage;
+}
+
+pub const PreserveAlphaCoverageOptions = struct {
+    coverage: f32,
+    max_steps: u8,
+    threshold: f32,
+};
+
+// XXX: could we make less steps if we know that the output is quantized? or at least stop
+// earlier?
+pub fn preserveAlphaCoverage(self: Image, options: PreserveAlphaCoverageOptions) void {
+    // Binary search for the best scale parameter
+    var best_scale: f32 = 1.0;
+    var best_dist = std.math.inf(f32);
+    var upper_threshold: f32 = 1.0;
+    var lower_threshold: f32 = 0.0;
+    var curr_threshold: f32 = options.threshold;
+    for (0..options.max_steps) |_| {
+        const curr_scale = options.threshold / curr_threshold;
+        const coverage = self.alphaCoverage(options.threshold, curr_scale);
+        const dist_to_coverage = @abs(coverage - options.coverage);
+        if (dist_to_coverage < best_dist) {
+            best_dist = dist_to_coverage;
+            best_scale = curr_scale;
+        }
+
+        if (coverage < options.coverage) {
+            upper_threshold = curr_threshold;
+        } else if (coverage > options.coverage) {
+            lower_threshold = curr_threshold;
+        } else {
+            break;
+        }
+
+        curr_threshold = (lower_threshold + upper_threshold) / 2.0;
+    }
+
+    // Apply the scaling
+    if (best_scale != 1.0) {
+        for (0..@as(usize, self.width) * @as(usize, self.height)) |i| {
+            const a = &self.data[i * 4 + 3];
+            a.* = @min(a.* * best_scale, 1.0);
+        }
+    }
 }
