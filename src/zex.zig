@@ -60,13 +60,8 @@ const command: Command = .{
     .named_args = &.{
         NamedArg.init(Alpha, .{
             .description = "whether or not the input is already premultiplied",
-            .long = "alpha-input",
+            .long = "input-alpha",
             .default = .{ .value = .straight },
-        }),
-        NamedArg.init(Alpha, .{
-            .description = "must be set if the alpha channel is transparency",
-            .long = "alpha-output",
-            .default = .{ .value = .premultiplied },
         }),
         NamedArg.init(?ZlibLevel, .{
             .description = "supercompress the data at the given level with zlib",
@@ -132,6 +127,10 @@ const command: Command = .{
             .long = "max-height",
             .default = .{ .value = null },
         }),
+        NamedArg.init(?u16, .{
+            .long = "max-threads",
+            .default = .{ .value = null },
+        }),
     },
     .positional_args = &.{
         PositionalArg.init([]const u8, .{
@@ -188,14 +187,6 @@ const bc7_command: Command = .{
             .long = "mode-6-only",
             .default = .{ .value = false },
         }),
-        NamedArg.init(?u32, .{
-            .long = "max-threads",
-            .default = .{ .value = null },
-        }),
-        NamedArg.init(bool, .{
-            .long = "status-output",
-            .default = .{ .value = false },
-        }),
     },
     .subcommands = &.{rdo_command},
 };
@@ -219,7 +210,7 @@ const rdo_command: Command = .{
             .default = .{ .value = 15.0 },
         }),
         NamedArg.init(bool, .{
-            .long = "quantize-mode6-endpoints",
+            .long = "quantize-mode-6-endpoints",
             .default = .{ .value = true },
         }),
         NamedArg.init(bool, .{
@@ -268,11 +259,6 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    if (args.named.@"alpha-input" == .premultiplied and args.named.@"alpha-output" == .straight) {
-        log.err("conversion from premultiplied to straight alpha is not supported", .{});
-        std.process.exit(1);
-    }
-
     const cwd = std.fs.cwd();
 
     // Load the first level
@@ -282,401 +268,6 @@ pub fn main() !void {
     };
     defer input.close();
 
-    const input_bytes = input.readToEndAllocOptions(allocator, max_file_len, null, 1, 0) catch |err| {
-        log.err("{s}: {s}", .{ args.positional.INPUT, @errorName(err) });
-        std.process.exit(1);
-    };
-    defer allocator.free(input_bytes);
-
-    const original = Image.init(.{
-        .bytes = input_bytes,
-        .color_space = switch (encoding) {
-            inline .bc7, .@"rgba-u8" => |ec| switch (ec.named.@"color-space") {
-                .srgb => .srgb,
-                .linear => .linear,
-            },
-            .@"rgba-f32" => .hdr,
-        },
-    }) catch |err| switch (err) {
-        error.StbImageFailure => {
-            log.err("{s}: failed reading image", .{args.positional.INPUT});
-            std.process.exit(1);
-        },
-        error.LdrAsHdr => {
-            log.err("{s}: cannot store LDR input image as HDR format", .{args.positional.INPUT});
-            std.process.exit(1);
-        },
-    };
-    defer original.deinit();
-
-    if (args.named.@"alpha-input" == .straight and args.named.@"alpha-output" == .premultiplied) {
-        original.premultiply();
-    }
-
-    const maybe_address_mode_u = args.named.@"address-mode-u" orelse args.named.@"address-mode";
-    const maybe_address_mode_v = args.named.@"address-mode-v" orelse args.named.@"address-mode";
-    const default_filter: Filter = if (original.hdr) .box else .mitchell;
-    const filter_u = args.named.@"filter-u" orelse args.named.filter orelse default_filter;
-    const filter_v = args.named.@"filter-v" orelse args.named.filter orelse default_filter;
-    if (filter_u == .box and maybe_address_mode_u != null and maybe_address_mode_u != .clamp) {
-        // Not supported by current STB, has no effect if set
-        log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
-        std.process.exit(1);
-    }
-    if (filter_v == .box and maybe_address_mode_v != null and maybe_address_mode_v != .clamp) {
-        // Not supported by current STB, has no effect if set
-        log.err("{s}: box filtering can only be used with address mode clamp", .{args.positional.INPUT});
-        std.process.exit(1);
-    }
-
-    // Sharpening filters can cause extreme artifacts on HDR images. See #15 for more
-    // information.
-    if (original.hdr) {
-        if (filter_u.filter().sharpens()) {
-            log.err(
-                "{s}: {s} filter applies sharpening, is not compatible with HDR images",
-                .{ args.positional.INPUT, @tagName(filter_u) },
-            );
-            std.process.exit(1);
-        }
-        if (filter_v.filter().sharpens()) {
-            log.err(
-                "{s}: {s} filter applies sharpening, is not compatible with HDR images",
-                .{ args.positional.INPUT, @tagName(filter_v) },
-            );
-            std.process.exit(1);
-        }
-    }
-
-    // Copy the original image into the mip levels, scaling it if needed.
-    var raw_levels: std.BoundedArray(Image, Ktx2.max_levels) = .{};
-    defer for (raw_levels.constSlice()[1..]) |level| {
-        level.deinit();
-    };
-    {
-        // Read the scale parameters
-        const maybe_max_width = args.named.@"max-width" orelse args.named.@"max-size";
-        const maybe_max_height = args.named.@"max-height" orelse args.named.@"max-size";
-
-        // Check if any scaling was requested
-        if (maybe_max_width != null or maybe_max_height != null) {
-            // If it was, validate the other input arguments, even if it turns out that the image
-            // is already small enough (an artist resizing an input image shouldn't cause a
-            // previously working bake step to start failing!)
-            const max_width = maybe_max_width orelse original.width;
-            const max_height = maybe_max_height orelse original.height;
-            const address_mode_u = maybe_address_mode_u orelse {
-                log.err("{s}: address-mode not set", .{args.positional.INPUT});
-                std.process.exit(1);
-            };
-            const address_mode_v = maybe_address_mode_v orelse {
-                log.err("{s}: address-mode not set", .{args.positional.INPUT});
-                std.process.exit(1);
-            };
-
-            // Perform the resize if one is necessary
-            const x_scale = @min(@as(f64, @floatFromInt(max_width)) / @as(f64, @floatFromInt(original.width)), 1.0);
-            const y_scale = @min(@as(f64, @floatFromInt(max_height)) / @as(f64, @floatFromInt(original.height)), 1.0);
-            const scale = @min(x_scale, y_scale);
-            const width = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(original.width)))), max_width);
-            const height = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(original.height)))), max_height);
-            const scaled = original.resize(.{
-                .width = width,
-                .height = height,
-                .address_mode_u = address_mode_u,
-                .address_mode_v = address_mode_v,
-                .filter_u = filter_u.filter(),
-                .filter_v = filter_v.filter(),
-            }) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    log.err("{s}: out of memory", .{args.positional.INPUT});
-                    std.process.exit(1);
-                },
-                error.StbResizeFailure => {
-                    log.err("{s}: STB resize failed", .{args.positional.INPUT});
-                    std.process.exit(1);
-                },
-            };
-            raw_levels.appendAssumeCapacity(scaled);
-        } else {
-            // We can elide this copy if it ends up being a perf/memory issue, for now it's
-            // convenient since we may use it to calculate coverage later.
-            raw_levels.appendAssumeCapacity(original.copy() catch |err| switch (err) {
-                error.OutOfMemory => {
-                    log.err("{s}: out of memory", .{args.positional.INPUT});
-                    std.process.exit(1);
-                },
-            });
-        }
-    }
-
-    // Generate mipmaps for the other levels if requested
-    if (args.named.@"generate-mipmaps") {
-        const address_mode_u = maybe_address_mode_u orelse {
-            log.err("{s}: address-mode not set", .{args.positional.INPUT});
-            std.process.exit(1);
-        };
-        const address_mode_v = maybe_address_mode_v orelse {
-            log.err("{s}: address-mode not set", .{args.positional.INPUT});
-            std.process.exit(1);
-        };
-
-        const block_size: u8 = switch (encoding) {
-            .@"rgba-u8", .@"rgba-f32" => 1,
-            .bc7 => 4,
-        };
-
-        var generate_mipmaps = raw_levels.get(0).generateMipmaps(.{
-            .address_mode_u = address_mode_u,
-            .address_mode_v = address_mode_v,
-            .filter_u = filter_u.filter(),
-            .filter_v = filter_v.filter(),
-            .block_size = block_size,
-        });
-
-        while (generate_mipmaps.next() catch |err| switch (err) {
-            error.OutOfMemory => {
-                log.err("{s}: out of memory", .{args.positional.INPUT});
-                std.process.exit(1);
-            },
-            error.StbResizeFailure => {
-                log.err("{s}: resize failed", .{args.positional.INPUT});
-                std.process.exit(1);
-            },
-        }) |mipmap| {
-            raw_levels.appendAssumeCapacity(mipmap);
-        }
-    }
-
-    // Cutout the textures if requested
-    if (args.named.@"preserve-alpha-coverage") |threshold_raw| {
-        // Check the threshold's range, and quantize it if necessary
-        if (threshold_raw < 0.0 or threshold_raw > 1.0) {
-            log.err("{s}: cutout threshold must be between 0 and 1 inclusive", .{args.positional.INPUT});
-            std.process.exit(1);
-        }
-        const threshold = switch (encoding) {
-            .@"rgba-u8", .bc7 => @round(threshold_raw * 255.0) / 255.0,
-            .@"rgba-f32" => threshold_raw,
-        };
-
-        // Determine the target coverage
-        const target_coverage = original.alphaCoverage(threshold, 1.0);
-
-        // Process each mip level. Technically we could skip the first level if no resizing was
-        // applied, for simplicity we don't do this right now.
-        for (raw_levels.constSlice()) |level| {
-            // Binary search for the best scale parameter
-            var best_scale: f32 = 1.0;
-            var best_dist = std.math.inf(f32);
-            var upper_threshold: f32 = 1.0;
-            var lower_threshold: f32 = 0.0;
-            var curr_threshold: f32 = threshold;
-            for (0..args.named.@"preserve-alpha-coverage-max-steps") |_| {
-                const curr_scale = threshold / curr_threshold;
-                const coverage = level.alphaCoverage(threshold, curr_scale);
-                const dist_to_coverage = @abs(coverage - target_coverage);
-                if (dist_to_coverage < best_dist) {
-                    best_dist = dist_to_coverage;
-                    best_scale = curr_scale;
-                }
-
-                if (coverage < target_coverage) {
-                    upper_threshold = curr_threshold;
-                } else if (coverage > target_coverage) {
-                    lower_threshold = curr_threshold;
-                } else {
-                    break;
-                }
-
-                curr_threshold = (lower_threshold + upper_threshold) / 2.0;
-            }
-
-            // Apply the scaling
-            if (best_scale != 1.0) {
-                for (0..@as(usize, level.width) * @as(usize, level.height)) |i| {
-                    const a = &level.data[i * 4 + 3];
-                    a.* = @min(a.* * best_scale, 1.0);
-                }
-            }
-        }
-    }
-
-    // Encode the pixel data
-    var bc7_encoders: std.BoundedArray(*Bc7Enc, Ktx2.max_levels) = .{};
-    defer for (bc7_encoders.constSlice()) |bc7_encoder| {
-        bc7_encoder.deinit();
-    };
-    var u8_encodings: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
-    defer for (u8_encodings.constSlice()) |u8_encoding| {
-        allocator.free(u8_encoding);
-    };
-    var encoded_levels: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
-    switch (encoding) {
-        .@"rgba-u8" => |encoding_options| for (raw_levels.constSlice()) |raw_level| {
-            const encoded_level = allocator.alloc(u8, raw_level.data.len) catch {
-                log.err("{s}: out of memory", .{args.positional.INPUT});
-                std.process.exit(1);
-            };
-            for (0..@as(usize, raw_level.width) * @as(usize, raw_level.height) * 4) |i| {
-                var ldr = raw_level.data[i];
-                if (encoding_options.named.@"color-space" == .srgb and i % 4 != 3) {
-                    ldr = std.math.pow(f32, ldr, 1.0 / 2.2);
-                }
-                ldr = std.math.clamp(ldr * 255.0 + 0.5, 0.0, 255.0);
-                encoded_level[i] = @intFromFloat(ldr);
-            }
-            u8_encodings.appendAssumeCapacity(encoded_level);
-            encoded_levels.appendAssumeCapacity(encoded_level);
-        },
-        .@"rgba-f32" => for (raw_levels.constSlice()) |raw_level| {
-            encoded_levels.appendAssumeCapacity(std.mem.sliceAsBytes(raw_level.data));
-        },
-        .bc7 => |bc7| {
-            // Determine the bc7 params
-            var params: Bc7Enc.Params = .{};
-            {
-                if (bc7.named.uber > Bc7Enc.Params.max_uber_level) {
-                    log.err("invalid value for uber", .{});
-                    std.process.exit(1);
-                }
-                params.bc7_uber_level = bc7.named.uber;
-
-                params.reduce_entropy = bc7.named.@"reduce-entropy";
-
-                if (bc7.named.@"max-partitions-to-scan" > Bc7Enc.Params.max_partitions) {
-                    log.err("invalid value for max-partitions-to-scan", .{});
-                    std.process.exit(1);
-                }
-                params.max_partitions_to_scan = bc7.named.@"max-partitions-to-scan";
-                // Ignored when using RDO. However, we use it in our bindings. The actual encoder
-                // just clears it so it doesn't matter that we set it regardless.
-                params.perceptual = bc7.named.@"color-space" == .srgb;
-                params.mode6_only = bc7.named.@"mode-6-only";
-
-                if (bc7.named.@"max-threads") |v| {
-                    if (v == 0) {
-                        log.err("invalid value for max-threads", .{});
-                        std.process.exit(1);
-                    }
-                    params.rdo_max_threads = v;
-                } else {
-                    params.rdo_max_threads = @intCast(std.math.clamp(
-                        std.Thread.getCpuCount() catch 1,
-                        1,
-                        std.math.maxInt(u32),
-                    ));
-                }
-                params.rdo_multithreading = params.rdo_max_threads > 1;
-                params.status_output = bc7.named.@"status-output";
-
-                if (bc7.subcommand) |bc7_subcommand| switch (bc7_subcommand) {
-                    .rdo => |rdo| {
-                        if ((rdo.named.lambda < 0.0) or (rdo.named.lambda > 500.0)) {
-                            log.err("invalid value for lambda", .{});
-                            std.process.exit(1);
-                        }
-                        params.rdo_lambda = rdo.named.lambda;
-
-                        if (rdo.named.@"lookback-window") |lookback_window| {
-                            if (lookback_window < Bc7Enc.Params.min_lookback_window_size) {
-                                log.err("invalid value for lookback-window", .{});
-                                std.process.exit(1);
-                            }
-                            params.lookback_window_size = lookback_window;
-                            params.custom_lookback_window_size = true;
-                        }
-
-                        if (rdo.named.@"smooth-block-error-scale") |v| {
-                            if ((v < 1.0) or (v > 500.0)) {
-                                log.err("invalid value for smooth-block-error-scale", .{});
-                                std.process.exit(1);
-                            }
-                            params.rdo_smooth_block_error_scale = v;
-                            params.custom_rdo_smooth_block_error_scale = true;
-                        }
-
-                        params.rdo_bc7_quant_mode6_endpoints = rdo.named.@"quantize-mode6-endpoints";
-                        params.rdo_bc7_weight_modes = rdo.named.@"weight-modes";
-                        params.rdo_bc7_weight_low_frequency_partitions = rdo.named.@"weight-low-frequency-partitions";
-                        params.rdo_bc7_pbit1_weighting = rdo.named.@"pbit1-weighting";
-
-                        if ((rdo.named.@"max-smooth-block-std-dev") < 0.000125 or (rdo.named.@"max-smooth-block-std-dev" > 256.0)) {
-                            log.err("invalid value for max-smooth-block-std-dev", .{});
-                            std.process.exit(1);
-                        }
-                        params.rdo_max_smooth_block_std_dev = rdo.named.@"max-smooth-block-std-dev";
-                        params.rdo_try_2_matches = rdo.named.@"try-two-matches";
-                        params.rdo_ultrasmooth_block_handling = rdo.named.@"ultrasmooth-block-handling";
-                    },
-                };
-            }
-
-            // Encode the levels
-            for (raw_levels.constSlice()) |raw_level| {
-                bc7_encoders.appendAssumeCapacity(Bc7Enc.init() orelse {
-                    log.err("bc7enc: initialization failed", .{});
-                    std.process.exit(1);
-                });
-
-                const bc7_encoder = bc7_encoders.get(bc7_encoders.len - 1);
-
-                if (!bc7_encoder.encode(
-                    &params,
-                    raw_level.width,
-                    raw_level.height,
-                    raw_level.data.ptr,
-                )) {
-                    log.err("{s}: encoder failed", .{args.positional.INPUT});
-                    std.process.exit(1);
-                }
-
-                encoded_levels.appendAssumeCapacity(bc7_encoder.getBlocks());
-            }
-        },
-    }
-
-    // Compress the data if needed
-    var compressed_levels: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
-    if (args.named.zlib) |zlib_level| {
-        for (encoded_levels.constSlice()) |level| {
-            var compressed = ArrayListUnmanaged(u8).initCapacity(allocator, encoded_levels.constSlice()[0].len) catch |err| {
-                log.err("{s}: deflate failed: {s}", .{ args.positional.OUTPUT, @errorName(err) });
-                std.process.exit(1);
-            };
-            defer compressed.deinit(allocator);
-
-            const Compressor = std.compress.flate.deflate.Compressor(.zlib, @TypeOf(compressed).Writer);
-            var compressor = Compressor.init(
-                compressed.writer(allocator),
-                .{ .level = zlib_level.toStdLevel() },
-            ) catch |err| {
-                log.err("{s}: deflate failed: {s}", .{ args.positional.OUTPUT, @errorName(err) });
-                std.process.exit(1);
-            };
-            _ = compressor.write(level) catch |err| {
-                log.err("{s}: deflate failed: {s}", .{ args.positional.OUTPUT, @errorName(err) });
-                std.process.exit(1);
-            };
-            compressor.finish() catch |err| {
-                log.err("{s}: deflate failed: {s}", .{ args.positional.OUTPUT, @errorName(err) });
-                std.process.exit(1);
-            };
-            compressed_levels.appendAssumeCapacity(compressed.toOwnedSlice(allocator) catch |err| {
-                log.err("{s}: deflate failed: {s}", .{ args.positional.OUTPUT, @errorName(err) });
-                std.process.exit(1);
-            });
-        }
-    } else {
-        for (encoded_levels.constSlice()) |encoded_level| {
-            compressed_levels.appendAssumeCapacity(encoded_level);
-        }
-    }
-    defer if (args.named.zlib != null) for (compressed_levels.constSlice()) |compressed_level| {
-        allocator.free(compressed_level);
-    };
-
-    // Create the output file writer
     var output_file = cwd.createFile(args.positional.OUTPUT, .{}) catch |err| {
         log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
         std.process.exit(1);
@@ -685,215 +276,651 @@ pub fn main() !void {
         output_file.sync() catch |err| @panic(@errorName(err));
         output_file.close();
     }
-    const writer = output_file.writer();
 
-    // Write the header
-    const samples: u8 = switch (encoding) {
-        .@"rgba-u8", .@"rgba-f32" => 4,
-        .bc7 => 1,
-    };
-    const index = Ktx2.Header.Index.init(.{
-        .levels = @intCast(compressed_levels.len),
-        .samples = samples,
-    });
-    writer.writeStruct(Ktx2.Header{
-        .format = switch (encoding) {
-            .@"rgba-u8" => |encoding_options| switch (encoding_options.named.@"color-space") {
-                .linear => .r8g8b8a8_uint,
-                .srgb => .r8g8b8a8_srgb,
-            },
-            .@"rgba-f32" => .r32g32b32a32_sfloat,
-            .bc7 => |encoding_options| switch (encoding_options.named.@"color-space") {
-                .linear => .bc7_unorm_block,
-                .srgb => .bc7_srgb_block,
-            },
-        },
-        .type_size = switch (encoding) {
-            .@"rgba-u8", .bc7 => 1,
-            .@"rgba-f32" => 4,
-        },
-        .pixel_width = raw_levels.get(0).width,
-        .pixel_height = raw_levels.get(0).height,
-        .pixel_depth = 0,
-        .layer_count = 0,
-        .face_count = 1,
-        .level_count = .fromInt(@intCast(compressed_levels.len)),
-        .supercompression_scheme = if (args.named.zlib != null) .zlib else .none,
-        .index = index,
-    }) catch |err| {
-        log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
+    const input_bytes = input.readToEndAllocOptions(allocator, max_file_len, null, 1, 0) catch |err| {
+        log.err("{s}: {s}", .{ args.positional.INPUT, @errorName(err) });
         std.process.exit(1);
     };
+    defer allocator.free(input_bytes);
 
-    const level_alignment: u8 = if (args.named.zlib != null) 1 else switch (encoding) {
-        .@"rgba-u8" => 4,
-        .@"rgba-f32" => 16,
-        .bc7 => 16,
-    };
-    {
-        // Calculate the byte offsets, taking into account that KTX2 requires mipmaps be stored from
-        // largest to smallest for streaming purposes
-        var byte_offsets_reverse: std.BoundedArray(usize, Ktx2.max_levels) = .{};
-        {
-            var byte_offset: usize = index.dfd_byte_offset + index.dfd_byte_length;
-            for (0..compressed_levels.len) |i| {
-                byte_offset = std.mem.alignForward(usize, byte_offset, level_alignment);
-                const compressed_level = compressed_levels.get(compressed_levels.len - i - 1);
-                byte_offsets_reverse.appendAssumeCapacity(byte_offset);
-                byte_offset += compressed_level.len;
+    try TextureWriter(std.fs.File.Writer).write(allocator, args, .{
+        .input = .{
+            .buffer = input_bytes,
+            .alpha = switch (args.named.@"input-alpha") {
+                .premultiplied => .premultiplied,
+                .straight => .straight,
+            },
+        },
+        .output = output_file.writer(),
+        .encoding = switch (encoding) {
+            .bc7 => |eo| .{ .bc7 = .{
+                .color_space = switch (eo.named.@"color-space") {
+                    .srgb => .srgb,
+                    .linear => .linear,
+                },
+                .uber_level = eo.named.uber,
+                .reduce_entropy = eo.named.@"reduce-entropy",
+                .max_partitions_to_scan = eo.named.@"max-partitions-to-scan",
+                .mode_6_only = eo.named.@"mode-6-only",
+                .rdo = if (eo.subcommand) |subcommand| switch (subcommand) {
+                    .rdo => |rdo| .{
+                        .lambda = rdo.named.lambda,
+                        .lookback_window = rdo.named.@"lookback-window",
+                        .smooth_block_error_scale = rdo.named.@"smooth-block-error-scale",
+                        .quantize_mode_6_endpoints = rdo.named.@"quantize-mode-6-endpoints",
+                        .weight_modes = rdo.named.@"weight-modes",
+                        .weight_low_frequency_partitions = rdo.named.@"weight-low-frequency-partitions",
+                        .pbit1_weighting = rdo.named.@"pbit1-weighting",
+                        .max_smooth_block_std_dev = rdo.named.@"max-smooth-block-std-dev",
+                        .try_two_matches = rdo.named.@"try-two-matches",
+                        .ultrasmooth_block_handling = rdo.named.@"ultrasmooth-block-handling",
+                    },
+                } else null,
+            } },
+            .@"rgba-u8" => |eo| .{ .rgba_u8 = .{
+                .color_space = switch (eo.named.@"color-space") {
+                    .linear => .linear,
+                    .srgb => .srgb,
+                },
+            } },
+            .@"rgba-f32" => .rgba_f32,
+        },
+        // XXX: some settings like this should be sorta global not per texture, that's fine could
+        // pass these in via build system! then can e.g. use threads when doing indvidiaul assets if
+        // we want. is bc7 stuff deterministic?
+        .max_threads = args.named.@"max-threads",
+        .generate_mipmaps = args.named.@"generate-mipmaps",
+        .alpha_test = if (args.named.@"preserve-alpha-coverage") |t| .{
+            .threshold = t,
+        } else null,
+        .max_size = args.named.@"max-size" orelse std.math.maxInt(u32),
+        .max_width = args.named.@"max-width" orelse std.math.maxInt(u32),
+        .max_height = args.named.@"max-height" orelse std.math.maxInt(u32),
+    });
+}
+
+// XXX: return error.InvalidParam instead of details, but log them.
+// XXX: naming
+pub fn TextureWriter(Writer: type) type {
+    return struct {
+        pub const WriteError = Writer.Error || error{
+            StbImageFailure,
+            LdrAsHdr,
+            InvalidOption,
+            StbResizeFailure,
+            OutOfMemory,
+            Bc7EncFailed,
+            // XXX: ?
+            UnfinishedBits,
+        };
+        pub const WriteOptions = struct {
+            input: struct {
+                // XXX: we can always assume it isn't, really we just want a bool for whether or not the
+                // channel represents transparency
+                alpha: enum { premultiplied, straight },
+                // XXX: or take a reader?
+                buffer: []const u8,
+            },
+            // XXX: this forces error to be anyerror...maybe we wanna make this generic, maybe make a texture
+            // writer object or something. that can take the non texture specific options?
+            output: Writer,
+            encoding: Encoding,
+            // XXX: use elsewhere too?
+            max_threads: ?u16 = null,
+            // XXX: add everything so we can remove args param
+            generate_mipmaps: bool = false,
+            alpha_test: ?struct {
+                threshold: f32 = 0.5,
+            } = null,
+            max_size: u32 = std.math.maxInt(u32),
+            max_width: u32 = std.math.maxInt(u32),
+            max_height: u32 = std.math.maxInt(u32),
+
+            pub const Encoding = union(enum) {
+                rgba_u8: struct {
+                    color_space: enum { srgb, linear },
+                },
+                rgba_f32: void,
+                bc7: struct {
+                    color_space: enum { srgb, linear },
+                    uber_level: u8 = Bc7Enc.Params.max_uber_level,
+                    reduce_entropy: bool = false,
+                    max_partitions_to_scan: u16 = Bc7Enc.Params.max_partitions,
+                    mode_6_only: bool = false,
+                    rdo: ?struct {
+                        lambda: f32 = 0.5,
+                        lookback_window: ?u17 = null,
+                        smooth_block_error_scale: ?f32 = 15.0,
+                        quantize_mode_6_endpoints: bool = true,
+                        weight_modes: bool = true,
+                        weight_low_frequency_partitions: bool = true,
+                        pbit1_weighting: bool = true,
+                        max_smooth_block_std_dev: f32 = 18.0,
+                        try_two_matches: bool = true,
+                        ultrasmooth_block_handling: bool = true,
+                    },
+                },
+            };
+        };
+
+        pub fn write(
+            gpa: std.mem.Allocator,
+            // XXX: incrementally pull out args into options
+            // XXX: then make sure that everything done in here COULD be done manually as well
+            // as a lower level api, esp encoding, and also, writing the ktx file
+            // XXX: I think we can make encode functions on the image, and writing the ktx file
+            // COULD be part of ktx2 or could be here
+            // XXX: return errors instead of exiting from here
+            args: Command.Result(command),
+            options: WriteOptions,
+            // XXX: make specific error type
+        ) WriteError!void {
+            const original = try Image.init(.{
+                .bytes = options.input.buffer,
+                .color_space = switch (options.encoding) {
+                    inline .bc7, .rgba_u8 => |ec| switch (ec.color_space) {
+                        .srgb => .srgb,
+                        .linear => .linear,
+                    },
+                    .rgba_f32 => .hdr,
+                },
+            });
+            defer original.deinit();
+
+            if (options.input.alpha == .straight) {
+                original.premultiply();
+            }
+
+            const maybe_address_mode_u = args.named.@"address-mode-u" orelse args.named.@"address-mode";
+            const maybe_address_mode_v = args.named.@"address-mode-v" orelse args.named.@"address-mode";
+            const default_filter: Filter = if (original.hdr) .box else .mitchell;
+            const filter_u = args.named.@"filter-u" orelse args.named.filter orelse default_filter;
+            const filter_v = args.named.@"filter-v" orelse args.named.filter orelse default_filter;
+
+            // Not supported by current STB, has no effect if set
+            if ((filter_u == .box and maybe_address_mode_u != null and maybe_address_mode_u != .clamp) or
+                (filter_v == .box and maybe_address_mode_v != null and maybe_address_mode_v != .clamp))
+            {
+                // XXX: could we specify the clamp mode per filter?
+                log.err("Box filtering is only compatible with the clamp address mode.", .{});
+                return error.InvalidOption;
+            }
+
+            // Sharpening filters can cause extreme artifacts on HDR images. See #15 for more
+            // information.
+            if (original.hdr and (filter_u.filter().sharpens() or filter_v.filter().sharpens())) {
+                // XXX: could we specify the filter type per input encoding?
+                log.err("Sharpen filters are not compatible with HDR inputs.", .{});
+                return error.InvalidOption;
+            }
+
+            // Copy the original image into the mip levels, scaling it if needed but preserving
+            // aspect ratio.
+            //
+            // We could elide this copy if the size doesn't change, but for now we don't because
+            // it's a simple way to keep the unmodified image around for possible alpha coverage
+            // calculations.
+            var raw_levels: std.BoundedArray(Image, Ktx2.max_levels) = .{};
+            defer for (raw_levels.constSlice()[1..]) |level| {
+                level.deinit();
+            };
+            {
+                const max_width = @min(options.max_width, options.max_size);
+                const max_height = @min(options.max_height, options.max_size);
+                const x_scale = @min(@as(f64, @floatFromInt(max_width)) / @as(f64, @floatFromInt(original.width)), 1.0);
+                const y_scale = @min(@as(f64, @floatFromInt(max_height)) / @as(f64, @floatFromInt(original.height)), 1.0);
+                const scale = @min(x_scale, y_scale);
+                const width = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(original.width)))), max_width);
+                const height = @min(@as(u32, @intFromFloat(scale * @as(f64, @floatFromInt(original.height)))), max_height);
+                // XXX: just have a default filter, and the ability to override it and the u and v
+                // ones. uhhh and make the address mode part of the filter I guess.
+                const address_mode_u = maybe_address_mode_u orelse {
+                    log.err("Resize requires an address mode.", .{});
+                    return error.InvalidOption;
+                };
+                const address_mode_v = maybe_address_mode_v orelse {
+                    log.err("Resize requires an address mode.", .{});
+                    return error.InvalidOption;
+                };
+                raw_levels.appendAssumeCapacity(try original.resize(.{
+                    .width = width,
+                    .height = height,
+                    .address_mode_u = address_mode_u,
+                    .address_mode_v = address_mode_v,
+                    .filter_u = filter_u.filter(),
+                    .filter_v = filter_v.filter(),
+                }));
+            }
+
+            // Generate mipmaps for the other levels if requested
+            if (options.generate_mipmaps) {
+                const address_mode_u = maybe_address_mode_u orelse {
+                    log.err("Resize requires an address mode.", .{});
+                    return error.InvalidOption;
+                };
+                const address_mode_v = maybe_address_mode_v orelse {
+                    log.err("Resize requires an address mode.", .{});
+                    return error.InvalidOption;
+                };
+
+                const block_size: u8 = switch (options.encoding) {
+                    .rgba_u8, .rgba_f32 => 1,
+                    .bc7 => 4,
+                };
+
+                var generate_mipmaps = raw_levels.get(0).generateMipmaps(.{
+                    .address_mode_u = address_mode_u,
+                    .address_mode_v = address_mode_v,
+                    .filter_u = filter_u.filter(),
+                    .filter_v = filter_v.filter(),
+                    .block_size = block_size,
+                });
+
+                while (try generate_mipmaps.next()) |mipmap| {
+                    raw_levels.appendAssumeCapacity(mipmap);
+                }
+            }
+
+            // Cutout the textures if requested
+            if (options.alpha_test) |alpha_test| {
+                // Quantize the threshold to the output type
+                const threshold = switch (options.encoding) {
+                    .rgba_u8, .bc7 => @round(alpha_test.threshold * 255.0) / 255.0,
+                    .rgba_f32 => alpha_test.threshold,
+                };
+
+                // Determine the target coverage
+                const target_coverage = original.alphaCoverage(threshold, 1.0);
+
+                // Process each mip level. Technically we could skip the first level if no resizing was
+                // applied, for simplicity we don't do this right now.
+                for (raw_levels.constSlice()) |level| {
+                    // Binary search for the best scale parameter
+                    var best_scale: f32 = 1.0;
+                    var best_dist = std.math.inf(f32);
+                    var upper_threshold: f32 = 1.0;
+                    var lower_threshold: f32 = 0.0;
+                    var curr_threshold: f32 = threshold;
+                    for (0..args.named.@"preserve-alpha-coverage-max-steps") |_| {
+                        const curr_scale = threshold / curr_threshold;
+                        const coverage = level.alphaCoverage(threshold, curr_scale);
+                        const dist_to_coverage = @abs(coverage - target_coverage);
+                        if (dist_to_coverage < best_dist) {
+                            best_dist = dist_to_coverage;
+                            best_scale = curr_scale;
+                        }
+
+                        if (coverage < target_coverage) {
+                            upper_threshold = curr_threshold;
+                        } else if (coverage > target_coverage) {
+                            lower_threshold = curr_threshold;
+                        } else {
+                            break;
+                        }
+
+                        curr_threshold = (lower_threshold + upper_threshold) / 2.0;
+                    }
+
+                    // Apply the scaling
+                    if (best_scale != 1.0) {
+                        for (0..@as(usize, level.width) * @as(usize, level.height)) |i| {
+                            const a = &level.data[i * 4 + 3];
+                            a.* = @min(a.* * best_scale, 1.0);
+                        }
+                    }
+                }
+            }
+
+            // Encode the pixel data
+            var bc7_encoders: std.BoundedArray(*Bc7Enc, Ktx2.max_levels) = .{};
+            defer for (bc7_encoders.constSlice()) |bc7_encoder| {
+                bc7_encoder.deinit();
+            };
+            var u8_encodings: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
+            defer for (u8_encodings.constSlice()) |u8_encoding| {
+                gpa.free(u8_encoding);
+            };
+            var encoded_levels: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
+            switch (options.encoding) {
+                .rgba_u8 => |eo| for (raw_levels.constSlice()) |raw_level| {
+                    const encoded_level = try gpa.alloc(u8, raw_level.data.len);
+                    for (0..@as(usize, raw_level.width) * @as(usize, raw_level.height) * 4) |i| {
+                        var ldr = raw_level.data[i];
+                        if (eo.color_space == .srgb and i % 4 != 3) {
+                            ldr = std.math.pow(f32, ldr, 1.0 / 2.2);
+                        }
+                        ldr = std.math.clamp(ldr * 255.0 + 0.5, 0.0, 255.0);
+                        encoded_level[i] = @intFromFloat(ldr);
+                    }
+                    u8_encodings.appendAssumeCapacity(encoded_level);
+                    encoded_levels.appendAssumeCapacity(encoded_level);
+                },
+                .rgba_f32 => for (raw_levels.constSlice()) |raw_level| {
+                    encoded_levels.appendAssumeCapacity(std.mem.sliceAsBytes(raw_level.data));
+                },
+                .bc7 => |eo| {
+                    // Determine the bc7 params
+                    var params: Bc7Enc.Params = .{};
+                    {
+                        if (eo.uber_level > Bc7Enc.Params.max_uber_level) {
+                            log.err("Invalid uber level.", .{});
+                            return error.InvalidOption;
+                        }
+                        params.bc7_uber_level = eo.uber_level;
+
+                        params.reduce_entropy = eo.reduce_entropy;
+
+                        if (eo.max_partitions_to_scan > Bc7Enc.Params.max_partitions) {
+                            log.err("Invalid max partitions to scan.", .{});
+                            return error.InvalidOption;
+                        }
+                        params.max_partitions_to_scan = eo.max_partitions_to_scan;
+                        // Ignored when using RDO. However, we use it in our bindings. The actual encoder
+                        // just clears it so it doesn't matter that we set it regardless.
+                        params.perceptual = eo.color_space == .srgb;
+                        params.mode6_only = eo.mode_6_only;
+
+                        if (options.max_threads) |v| {
+                            // XXX: check at top. why is 0 an error?
+                            if (v == 0) {
+                                log.err("Invalid max threads.", .{});
+                                return error.InvalidOption;
+                            }
+                            params.rdo_max_threads = v;
+                        } else {
+                            params.rdo_max_threads = @intCast(std.math.clamp(
+                                std.Thread.getCpuCount() catch 1,
+                                1,
+                                std.math.maxInt(u32),
+                            ));
+                        }
+                        params.rdo_multithreading = params.rdo_max_threads > 1;
+
+                        if (eo.rdo) |rdo| {
+                            if ((rdo.lambda < 0.0) or (rdo.lambda > 500.0)) {
+                                log.err("Invalid RDO lambda.", .{});
+                                return error.InvalidOption;
+                            }
+                            params.rdo_lambda = rdo.lambda;
+
+                            if (rdo.lookback_window) |lookback_window| {
+                                if (lookback_window < Bc7Enc.Params.min_lookback_window_size) {
+                                    log.err("Invalid lookback window.", .{});
+                                    return error.InvalidOption;
+                                }
+                                params.lookback_window_size = lookback_window;
+                                params.custom_lookback_window_size = true;
+                            }
+
+                            if (rdo.smooth_block_error_scale) |v| {
+                                if ((v < 1.0) or (v > 500.0)) {
+                                    log.err("Invalid smooth block error scale.", .{});
+                                    return error.InvalidOption;
+                                }
+                                params.rdo_smooth_block_error_scale = v;
+                                params.custom_rdo_smooth_block_error_scale = true;
+                            }
+
+                            params.rdo_bc7_quant_mode6_endpoints = rdo.quantize_mode_6_endpoints;
+                            params.rdo_bc7_weight_modes = rdo.weight_modes;
+                            params.rdo_bc7_weight_low_frequency_partitions = rdo.weight_low_frequency_partitions;
+                            params.rdo_bc7_pbit1_weighting = rdo.pbit1_weighting;
+
+                            if ((rdo.max_smooth_block_std_dev) < 0.000125 or (rdo.max_smooth_block_std_dev > 256.0)) {
+                                log.err("Invalid smooth block standard deviation.", .{});
+                                return error.InvalidOption;
+                            }
+                            params.rdo_max_smooth_block_std_dev = rdo.max_smooth_block_std_dev;
+                            params.rdo_try_2_matches = rdo.try_two_matches;
+                            params.rdo_ultrasmooth_block_handling = rdo.ultrasmooth_block_handling;
+                        }
+                    }
+
+                    // Encode the levels
+                    for (raw_levels.constSlice()) |raw_level| {
+                        bc7_encoders.appendAssumeCapacity(Bc7Enc.init() orelse {
+                            return error.Bc7EncFailed;
+                        });
+
+                        const bc7_encoder = bc7_encoders.get(bc7_encoders.len - 1);
+
+                        if (!bc7_encoder.encode(
+                            &params,
+                            raw_level.width,
+                            raw_level.height,
+                            raw_level.data.ptr,
+                        )) {
+                            return error.Bc7EncFailed;
+                        }
+
+                        encoded_levels.appendAssumeCapacity(bc7_encoder.getBlocks());
+                    }
+                },
+            }
+
+            // Compress the data if needed
+            var compressed_levels: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
+            if (args.named.zlib) |zlib_level| {
+                for (encoded_levels.constSlice()) |level| {
+                    var compressed = try ArrayListUnmanaged(u8).initCapacity(
+                        gpa,
+                        encoded_levels.constSlice()[0].len,
+                    );
+                    defer compressed.deinit(gpa);
+
+                    const Compressor = std.compress.flate.deflate.Compressor(
+                        .zlib,
+                        @TypeOf(compressed).Writer,
+                    );
+                    var compressor = try Compressor.init(
+                        compressed.writer(gpa),
+                        .{ .level = zlib_level.toStdLevel() },
+                    );
+                    _ = try compressor.write(level);
+                    try compressor.finish();
+                    compressed_levels.appendAssumeCapacity(try compressed.toOwnedSlice(gpa));
+                }
+            } else {
+                for (encoded_levels.constSlice()) |encoded_level| {
+                    compressed_levels.appendAssumeCapacity(encoded_level);
+                }
+            }
+            defer if (args.named.zlib != null) for (compressed_levels.constSlice()) |compressed_level| {
+                gpa.free(compressed_level);
+            };
+
+            // Write the header
+            const samples: u8 = switch (options.encoding) {
+                .rgba_u8, .rgba_f32 => 4,
+                .bc7 => 1,
+            };
+            const index = Ktx2.Header.Index.init(.{
+                .levels = @intCast(compressed_levels.len),
+                .samples = samples,
+            });
+            try options.output.writeStruct(Ktx2.Header{
+                .format = switch (options.encoding) {
+                    .rgba_u8 => |eo| switch (eo.color_space) {
+                        .linear => .r8g8b8a8_uint,
+                        .srgb => .r8g8b8a8_srgb,
+                    },
+                    .rgba_f32 => .r32g32b32a32_sfloat,
+                    .bc7 => |eo| switch (eo.color_space) {
+                        .linear => .bc7_unorm_block,
+                        .srgb => .bc7_srgb_block,
+                    },
+                },
+                .type_size = switch (options.encoding) {
+                    .rgba_u8, .bc7 => 1,
+                    .rgba_f32 => 4,
+                },
+                .pixel_width = raw_levels.get(0).width,
+                .pixel_height = raw_levels.get(0).height,
+                .pixel_depth = 0,
+                .layer_count = 0,
+                .face_count = 1,
+                .level_count = .fromInt(@intCast(compressed_levels.len)),
+                .supercompression_scheme = if (args.named.zlib != null) .zlib else .none,
+                .index = index,
+            });
+
+            const level_alignment: u8 = if (args.named.zlib != null) 1 else switch (options.encoding) {
+                .rgba_u8 => 4,
+                .rgba_f32 => 16,
+                .bc7 => 16,
+            };
+            {
+                // Calculate the byte offsets, taking into account that KTX2 requires mipmaps be stored from
+                // largest to smallest for streaming purposes
+                var byte_offsets_reverse: std.BoundedArray(usize, Ktx2.max_levels) = .{};
+                {
+                    var byte_offset: usize = index.dfd_byte_offset + index.dfd_byte_length;
+                    for (0..compressed_levels.len) |i| {
+                        byte_offset = std.mem.alignForward(usize, byte_offset, level_alignment);
+                        const compressed_level = compressed_levels.get(compressed_levels.len - i - 1);
+                        byte_offsets_reverse.appendAssumeCapacity(byte_offset);
+                        byte_offset += compressed_level.len;
+                    }
+                }
+
+                // Write the level index data, this is done from largest to smallest, only the actual data
+                // is stored in reverse order.
+                for (0..compressed_levels.len) |i| {
+                    try options.output.writeStruct(Ktx2.Level{
+                        .byte_offset = byte_offsets_reverse.get(compressed_levels.len - i - 1),
+                        .byte_length = compressed_levels.get(i).len,
+                        .uncompressed_byte_length = encoded_levels.get(i).len,
+                    });
+                }
+            }
+
+            // Write the data descriptor
+            try options.output.writeInt(u32, index.dfd_byte_length, .little);
+            try options.output.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock{
+                .descriptor_block_size = Ktx2.BasicDescriptorBlock.descriptorBlockSize(samples),
+                .model = switch (options.encoding) {
+                    .rgba_u8, .rgba_f32 => .rgbsda,
+                    .bc7 => .bc7,
+                },
+                .primaries = .bt709,
+                .transfer = switch (options.encoding) {
+                    .rgba_f32 => .linear,
+                    inline else => |eo| switch (eo.color_space) {
+                        .linear => .linear,
+                        .srgb => .srgb,
+                    },
+                },
+                .flags = .{
+                    // XXX: are we supposed to set this even if it doesn't represent transparency or no?
+                    .alpha_premultiplied = true,
+                },
+                .texel_block_dimension_0 = switch (options.encoding) {
+                    .rgba_u8, .rgba_f32 => .fromInt(1),
+                    .bc7 => .fromInt(4),
+                },
+                .texel_block_dimension_1 = switch (options.encoding) {
+                    .rgba_u8, .rgba_f32 => .fromInt(1),
+                    .bc7 => .fromInt(4),
+                },
+                .texel_block_dimension_2 = .fromInt(1),
+                .texel_block_dimension_3 = .fromInt(1),
+                .bytes_plane_0 = if (args.named.zlib != null) 0 else switch (options.encoding) {
+                    .rgba_u8 => 4,
+                    .rgba_f32 => 16,
+                    .bc7 => 16,
+                },
+                .bytes_plane_1 = 0,
+                .bytes_plane_2 = 0,
+                .bytes_plane_3 = 0,
+                .bytes_plane_4 = 0,
+                .bytes_plane_5 = 0,
+                .bytes_plane_6 = 0,
+                .bytes_plane_7 = 0,
+            })[0 .. @bitSizeOf(Ktx2.BasicDescriptorBlock) / 8]);
+            switch (options.encoding) {
+                .rgba_u8 => |eo| for (0..4) |i| {
+                    const ChannelType = Ktx2.BasicDescriptorBlock.Sample.ChannelType(.rgbsda);
+                    const channel_type: ChannelType = if (i == 3) .alpha else @enumFromInt(i);
+                    options.output.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock.Sample{
+                        .bit_offset = .fromInt(8 * @as(u16, @intCast(i))),
+                        .bit_length = .fromInt(8),
+                        .channel_type = @enumFromInt(@intFromEnum(channel_type)),
+                        .linear = switch (eo.color_space) {
+                            .linear => false,
+                            .srgb => i == 3,
+                        },
+                        .exponent = false,
+                        .signed = false,
+                        .float = false,
+                        .sample_position_0 = 0,
+                        .sample_position_1 = 0,
+                        .sample_position_2 = 0,
+                        .sample_position_3 = 0,
+                        .lower = 0,
+                        .upper = switch (eo.color_space) {
+                            .linear => 1,
+                            .srgb => 255,
+                        },
+                    })) catch unreachable;
+                },
+                .rgba_f32 => for (0..4) |i| {
+                    const ChannelType = Ktx2.BasicDescriptorBlock.Sample.ChannelType(.rgbsda);
+                    const channel_type: ChannelType = if (i == 3) .alpha else @enumFromInt(i);
+                    options.output.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock.Sample{
+                        .bit_offset = .fromInt(32 * @as(u16, @intCast(i))),
+                        .bit_length = .fromInt(32),
+                        .channel_type = @enumFromInt(@intFromEnum(channel_type)),
+                        .linear = false,
+                        .exponent = false,
+                        .signed = true,
+                        .float = true,
+                        .sample_position_0 = 0,
+                        .sample_position_1 = 0,
+                        .sample_position_2 = 0,
+                        .sample_position_3 = 0,
+                        .lower = @bitCast(@as(f32, -1.0)),
+                        .upper = @bitCast(@as(f32, 1.0)),
+                    })) catch unreachable;
+                },
+                .bc7 => {
+                    const ChannelType = Ktx2.BasicDescriptorBlock.Sample.ChannelType(.bc7);
+                    const channel_type: ChannelType = .data;
+                    options.output.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock.Sample{
+                        .bit_offset = .fromInt(0),
+                        .bit_length = .fromInt(128),
+                        .channel_type = @enumFromInt(@intFromEnum(channel_type)),
+                        .linear = false,
+                        .exponent = false,
+                        .signed = false,
+                        .float = false,
+                        .sample_position_0 = 0,
+                        .sample_position_1 = 0,
+                        .sample_position_2 = 0,
+                        .sample_position_3 = 0,
+                        .lower = 0,
+                        .upper = std.math.maxInt(u32),
+                    })) catch unreachable;
+                },
+            }
+
+            // Write the compressed data. Note that KTX2 requires mips be stored form smallest to largest
+            // for streaming purposes.
+            {
+                var byte_offset: usize = index.dfd_byte_offset + index.dfd_byte_length;
+                for (0..compressed_levels.len) |i| {
+                    // Write padding
+                    const padded = std.mem.alignForward(usize, byte_offset, level_alignment);
+                    try options.output.writeByteNTimes(0, padded - byte_offset);
+                    byte_offset = padded;
+
+                    // Write the level
+                    const compressed_level = compressed_levels.get(compressed_levels.len - i - 1);
+                    try options.output.writeAll(compressed_level);
+                    byte_offset += compressed_level.len;
+                }
             }
         }
-
-        // Write the level index data, this is done from largest to smallest, only the actual data
-        // is stored in reverse order.
-        for (0..compressed_levels.len) |i| {
-            writer.writeStruct(Ktx2.Level{
-                .byte_offset = byte_offsets_reverse.get(compressed_levels.len - i - 1),
-                .byte_length = compressed_levels.get(i).len,
-                .uncompressed_byte_length = encoded_levels.get(i).len,
-            }) catch |err| {
-                log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
-                std.process.exit(1);
-            };
-        }
-    }
-
-    // Write the data descriptor
-    writer.writeInt(u32, index.dfd_byte_length, .little) catch |err| {
-        log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
-        std.process.exit(1);
     };
-    writer.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock{
-        .descriptor_block_size = Ktx2.BasicDescriptorBlock.descriptorBlockSize(samples),
-        .model = switch (encoding) {
-            .@"rgba-u8", .@"rgba-f32" => .rgbsda,
-            .bc7 => .bc7,
-        },
-        .primaries = .bt709,
-        .transfer = switch (encoding) {
-            .@"rgba-f32" => .linear,
-            inline else => |encoding_options| switch (encoding_options.named.@"color-space") {
-                .linear => .linear,
-                .srgb => .srgb,
-            },
-        },
-        .flags = .{
-            .alpha_premultiplied = args.named.@"alpha-output" == .premultiplied,
-        },
-        .texel_block_dimension_0 = switch (encoding) {
-            .@"rgba-u8", .@"rgba-f32" => .fromInt(1),
-            .bc7 => .fromInt(4),
-        },
-        .texel_block_dimension_1 = switch (encoding) {
-            .@"rgba-u8", .@"rgba-f32" => .fromInt(1),
-            .bc7 => .fromInt(4),
-        },
-        .texel_block_dimension_2 = .fromInt(1),
-        .texel_block_dimension_3 = .fromInt(1),
-        .bytes_plane_0 = if (args.named.zlib != null) 0 else switch (encoding) {
-            .@"rgba-u8" => 4,
-            .@"rgba-f32" => 16,
-            .bc7 => 16,
-        },
-        .bytes_plane_1 = 0,
-        .bytes_plane_2 = 0,
-        .bytes_plane_3 = 0,
-        .bytes_plane_4 = 0,
-        .bytes_plane_5 = 0,
-        .bytes_plane_6 = 0,
-        .bytes_plane_7 = 0,
-    })[0 .. @bitSizeOf(Ktx2.BasicDescriptorBlock) / 8]) catch |err| {
-        log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
-        std.process.exit(1);
-    };
-    switch (encoding) {
-        .@"rgba-u8" => |encoding_options| for (0..4) |i| {
-            const ChannelType = Ktx2.BasicDescriptorBlock.Sample.ChannelType(.rgbsda);
-            const channel_type: ChannelType = if (i == 3) .alpha else @enumFromInt(i);
-            writer.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock.Sample{
-                .bit_offset = .fromInt(8 * @as(u16, @intCast(i))),
-                .bit_length = .fromInt(8),
-                .channel_type = @enumFromInt(@intFromEnum(channel_type)),
-                .linear = switch (encoding_options.named.@"color-space") {
-                    .linear => false,
-                    .srgb => i == 3,
-                },
-                .exponent = false,
-                .signed = false,
-                .float = false,
-                .sample_position_0 = 0,
-                .sample_position_1 = 0,
-                .sample_position_2 = 0,
-                .sample_position_3 = 0,
-                .lower = 0,
-                .upper = switch (encoding_options.named.@"color-space") {
-                    .linear => 1,
-                    .srgb => 255,
-                },
-            })) catch unreachable;
-        },
-        .@"rgba-f32" => for (0..4) |i| {
-            const ChannelType = Ktx2.BasicDescriptorBlock.Sample.ChannelType(.rgbsda);
-            const channel_type: ChannelType = if (i == 3) .alpha else @enumFromInt(i);
-            writer.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock.Sample{
-                .bit_offset = .fromInt(32 * @as(u16, @intCast(i))),
-                .bit_length = .fromInt(32),
-                .channel_type = @enumFromInt(@intFromEnum(channel_type)),
-                .linear = false,
-                .exponent = false,
-                .signed = true,
-                .float = true,
-                .sample_position_0 = 0,
-                .sample_position_1 = 0,
-                .sample_position_2 = 0,
-                .sample_position_3 = 0,
-                .lower = @bitCast(@as(f32, -1.0)),
-                .upper = @bitCast(@as(f32, 1.0)),
-            })) catch unreachable;
-        },
-        .bc7 => {
-            const ChannelType = Ktx2.BasicDescriptorBlock.Sample.ChannelType(.bc7);
-            const channel_type: ChannelType = .data;
-            writer.writeAll(std.mem.asBytes(&Ktx2.BasicDescriptorBlock.Sample{
-                .bit_offset = .fromInt(0),
-                .bit_length = .fromInt(128),
-                .channel_type = @enumFromInt(@intFromEnum(channel_type)),
-                .linear = false,
-                .exponent = false,
-                .signed = false,
-                .float = false,
-                .sample_position_0 = 0,
-                .sample_position_1 = 0,
-                .sample_position_2 = 0,
-                .sample_position_3 = 0,
-                .lower = 0,
-                .upper = std.math.maxInt(u32),
-            })) catch unreachable;
-        },
-    }
-
-    // Write the compressed data. Note that KTX2 requires mips be stored form smallest to largest
-    // for streaming purposes.
-    {
-        var byte_offset: usize = index.dfd_byte_offset + index.dfd_byte_length;
-        for (0..compressed_levels.len) |i| {
-            // Write padding
-            const padded = std.mem.alignForward(usize, byte_offset, level_alignment);
-            writer.writeByteNTimes(0, padded - byte_offset) catch |err| {
-                log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
-                std.process.exit(1);
-            };
-            byte_offset = padded;
-
-            // Write the level
-            const compressed_level = compressed_levels.get(compressed_levels.len - i - 1);
-            writer.writeAll(compressed_level) catch |err| {
-                log.err("{s}: {s}", .{ args.positional.OUTPUT, @errorName(err) });
-                std.process.exit(1);
-            };
-            byte_offset += compressed_level.len;
-        }
-    }
 }
 
 const Bc7Enc = opaque {
