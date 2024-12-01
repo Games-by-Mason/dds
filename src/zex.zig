@@ -1,5 +1,4 @@
 const std = @import("std");
-const ArrayListUnmanaged = std.ArrayListUnmanaged;
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Ktx2 = @import("Ktx2");
@@ -10,6 +9,10 @@ const PositionalArg = structopt.PositionalArg;
 const log = std.log;
 const c = @import("c.zig");
 const Image = @import("Image.zig");
+// XXX: make the library build that exposes encoder and image and this stuff, separate from
+// the command line tool. Keep ktx on its own though since the runtime only needs that!
+const EncodedImage = @import("EncodedImage.zig");
+const CompressedImage = @import("CompressedImage.zig");
 
 const ColorSpace = enum {
     linear,
@@ -162,7 +165,7 @@ const bc7_command: Command = .{
         NamedArg.init(u8, .{
             .description = "quality level, defaults to highest",
             .long = "uber",
-            .default = .{ .value = Bc7Enc.Params.max_uber_level },
+            .default = .{ .value = EncodedImage.Bc7Enc.Params.max_uber_level },
         }),
         NamedArg.init(bool, .{
             .description = "reduce entropy for better supercompression",
@@ -172,7 +175,7 @@ const bc7_command: Command = .{
         NamedArg.init(u8, .{
             .description = "partitions to scan in mode 1, defaults to highest",
             .long = "max-partitions-to-scan",
-            .default = .{ .value = Bc7Enc.Params.max_partitions },
+            .default = .{ .value = EncodedImage.Bc7Enc.Params.max_partitions },
         }),
         NamedArg.init(bool, .{
             .long = "mode-6-only",
@@ -298,22 +301,6 @@ pub fn main() !void {
                             .ultrasmooth_block_handling = rdo.named.@"ultrasmooth-block-handling",
                         },
                     } else null,
-                    // XXX: ...
-                    .filter_u = switch (args.named.@"filter-u" orelse args.named.filter orelse @panic("unimplemented")) {
-                        .triangle => .triangle,
-                        .@"cubic-b-spline" => .cubic_b_spline,
-                        .@"catmull-rom" => .catmull_rom,
-                        .mitchell => .mitchell,
-                        .@"point-sample" => .point_sample,
-                    },
-                    // XXX: ...
-                    .filter_v = switch (args.named.@"filter-v" orelse args.named.filter orelse @panic("unimplemented")) {
-                        .triangle => .triangle,
-                        .@"cubic-b-spline" => .cubic_b_spline,
-                        .@"catmull-rom" => .catmull_rom,
-                        .mitchell => .mitchell,
-                        .@"point-sample" => .point_sample,
-                    },
                 },
             },
             .@"rgba-u8" => |eo| .{
@@ -322,44 +309,27 @@ pub fn main() !void {
                         .linear => .linear,
                         .srgb => .srgb,
                     },
-                    // XXX: ...
-                    .filter_u = switch (args.named.@"filter-u" orelse args.named.filter orelse @panic("unimplemented")) {
-                        .triangle => .triangle,
-                        .@"cubic-b-spline" => .cubic_b_spline,
-                        .@"catmull-rom" => .catmull_rom,
-                        .mitchell => .mitchell,
-                        .@"point-sample" => .point_sample,
-                    },
-                    // XXX: ...
-                    .filter_v = switch (args.named.@"filter-v" orelse args.named.filter orelse @panic("unimplemented")) {
-                        .triangle => .triangle,
-                        .@"cubic-b-spline" => .cubic_b_spline,
-                        .@"catmull-rom" => .catmull_rom,
-                        .mitchell => .mitchell,
-                        .@"point-sample" => .point_sample,
-                    },
                 },
             },
             .@"rgba-f32" => .{
-                .rgba_f32 = .{
-                    // XXX: ...
-                    .filter_u = switch (args.named.@"filter-u" orelse args.named.filter orelse @panic("unimplemented")) {
-                        .triangle => .triangle,
-                        .@"cubic-b-spline" => .cubic_b_spline,
-                        .@"catmull-rom" => .catmull_rom,
-                        .mitchell => .mitchell,
-                        .@"point-sample" => .point_sample,
-                    },
-                    // XXX: ...
-                    .filter_v = switch (args.named.@"filter-v" orelse args.named.filter orelse @panic("unimplemented")) {
-                        .triangle => .triangle,
-                        .@"cubic-b-spline" => .cubic_b_spline,
-                        .@"catmull-rom" => .catmull_rom,
-                        .mitchell => .mitchell,
-                        .@"point-sample" => .point_sample,
-                    },
-                },
+                .rgba_f32 = .{},
             },
+        },
+        // XXX: ...
+        .filter_u = switch (args.named.@"filter-u" orelse args.named.filter orelse @panic("unimplemented")) {
+            .triangle => .triangle,
+            .@"cubic-b-spline" => .cubic_b_spline,
+            .@"catmull-rom" => .catmull_rom,
+            .mitchell => .mitchell,
+            .@"point-sample" => .point_sample,
+        },
+        // XXX: ...
+        .filter_v = switch (args.named.@"filter-v" orelse args.named.filter orelse @panic("unimplemented")) {
+            .triangle => .triangle,
+            .@"cubic-b-spline" => .cubic_b_spline,
+            .@"catmull-rom" => .catmull_rom,
+            .mitchell => .mitchell,
+            .@"point-sample" => .point_sample,
         },
         // XXX: it should be possible to set a default for a lot of settings globally, and then override
         // them per texture. e.g. you may want to just say "supercompress all assets" but then you may
@@ -391,7 +361,7 @@ pub const CreateTextureError = error{
     InvalidOption,
     StbResizeFailure,
     OutOfMemory,
-    Bc7EncFailed,
+    EncoderFailed,
     // XXX: ?
     UnfinishedBits,
     StreamTooLong,
@@ -400,7 +370,7 @@ pub const CreateTextureOptions = struct {
     alpha_is_transparency: bool = true,
     // XXX: this forces error to be anyerror...maybe we wanna make this generic, maybe make a texture
     // writer object or something. that can take the non texture specific options?
-    encoding: Encoding,
+    encoding: EncodedImage.Options,
     // XXX: use elsewhere too?
     max_threads: ?u16 = null,
     // XXX: add everything so we can remove args param
@@ -414,86 +384,18 @@ pub const CreateTextureOptions = struct {
     max_height: u32 = std.math.maxInt(u32),
     address_mode_u: Image.AddressMode,
     address_mode_v: Image.AddressMode,
-    supercompression: Supercompression = .none,
+    supercompression: CompressedImage.Options = .none,
+    filter: Image.Filter = .mitchell,
+    filter_u: ?Image.Filter = null,
+    filter_v: ?Image.Filter = null,
 
-    pub const Encoding = union(enum) {
-        pub const Rgba8 = struct {
-            color_space: enum { srgb, linear },
-            filter: Image.Filter = .mitchell,
-            filter_u: ?Image.Filter = null,
-            filter_v: ?Image.Filter = null,
-        };
-        pub const RgbaF32 = struct {
-            // XXX: document the different default here
-            filter: Image.Filter = .triangle,
-            filter_u: ?Image.Filter = null,
-            filter_v: ?Image.Filter = null,
-        };
-        pub const Bc7 = struct {
-            filter: Image.Filter = .mitchell,
-            filter_u: ?Image.Filter = null,
-            filter_v: ?Image.Filter = null,
-            color_space: enum { srgb, linear },
-            uber_level: u8 = Bc7Enc.Params.max_uber_level,
-            reduce_entropy: bool = false,
-            max_partitions_to_scan: u16 = Bc7Enc.Params.max_partitions,
-            mode_6_only: bool = false,
-            rdo: ?struct {
-                lambda: f32 = 0.5,
-                lookback_window: ?u17 = null,
-                smooth_block_error_scale: ?f32 = 15.0,
-                quantize_mode_6_endpoints: bool = true,
-                weight_modes: bool = true,
-                weight_low_frequency_partitions: bool = true,
-                pbit1_weighting: bool = true,
-                max_smooth_block_std_dev: f32 = 18.0,
-                try_two_matches: bool = true,
-                ultrasmooth_block_handling: bool = true,
-            },
-        };
+    pub fn filterU(self: @This()) Image.Filter {
+        return self.filter_u orelse self.filter;
+    }
 
-        rgba_u8: Rgba8,
-        rgba_f32: RgbaF32,
-        bc7: Bc7,
-
-        pub fn filterU(self: @This()) Image.Filter {
-            return switch (self) {
-                inline else => |eo| eo.filter_u orelse eo.filter,
-            };
-        }
-
-        pub fn filterV(self: @This()) Image.Filter {
-            return switch (self) {
-                inline else => |eo| eo.filter_v orelse eo.filter,
-            };
-        }
-
-        pub fn blockSize(self: @This()) u8 {
-            return switch (self) {
-                .rgba_u8, .rgba_f32 => 1,
-                .bc7 => 4,
-            };
-        }
-
-        pub fn colorSpace(self: @This()) Image.ColorSpace {
-            return switch (self) {
-                inline .bc7, .rgba_u8 => |ec| switch (ec.color_space) {
-                    .srgb => .srgb,
-                    .linear => .linear,
-                },
-                .rgba_f32 => .hdr,
-            };
-        }
-    };
-
-    pub const Supercompression = union(enum) {
-        pub const Zlib = struct {
-            level: std.compress.flate.deflate.Level,
-        };
-
-        zlib: Zlib,
-        none: void,
-    };
+    pub fn filterV(self: @This()) Image.Filter {
+        return self.filter_v orelse self.filter;
+    }
 };
 
 // XXX: then make sure that everything done in here COULD be done manually as well
@@ -529,8 +431,8 @@ pub fn createTexture(
         .max_height = options.max_height,
         .address_mode_u = options.address_mode_u,
         .address_mode_v = options.address_mode_v,
-        .filter_u = options.encoding.filterU(),
-        .filter_v = options.encoding.filterV(),
+        .filter_u = options.filterU(),
+        .filter_v = options.filterV(),
     }));
 
     // Generate any other requested mipmaps.
@@ -538,8 +440,8 @@ pub fn createTexture(
         var generate_mipmaps = raw_levels.get(0).generateMipmaps(.{
             .address_mode_u = options.address_mode_u,
             .address_mode_v = options.address_mode_v,
-            .filter_u = options.encoding.filterU(),
-            .filter_v = options.encoding.filterV(),
+            .filter_u = options.filterU(),
+            .filter_v = options.filterV(),
             .block_size = options.encoding.blockSize(),
         });
 
@@ -561,166 +463,36 @@ pub fn createTexture(
         }
     }
 
-    // XXX: move encoding onto image
     // Encode the pixel data
-    var bc7_encoders: std.BoundedArray(*Bc7Enc, Ktx2.max_levels) = .{};
-    defer for (bc7_encoders.constSlice()) |bc7_encoder| {
-        bc7_encoder.deinit();
+    var encoded_levels: std.BoundedArray(EncodedImage, Ktx2.max_levels) = .{};
+    defer for (encoded_levels.constSlice()) |level| {
+        level.deinit(gpa);
     };
-    var u8_encodings: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
-    defer for (u8_encodings.constSlice()) |u8_encoding| {
-        gpa.free(u8_encoding);
-    };
-    var encoded_levels: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
-    switch (options.encoding) {
-        .rgba_u8 => |eo| for (raw_levels.constSlice()) |raw_level| {
-            const encoded_level = try gpa.alloc(u8, raw_level.data.len);
-            for (0..@as(usize, raw_level.width) * @as(usize, raw_level.height) * 4) |i| {
-                var ldr = raw_level.data[i];
-                if (eo.color_space == .srgb and i % 4 != 3) {
-                    ldr = std.math.pow(f32, ldr, 1.0 / 2.2);
-                }
-                ldr = std.math.clamp(ldr * 255.0 + 0.5, 0.0, 255.0);
-                encoded_level[i] = @intFromFloat(ldr);
-            }
-            u8_encodings.appendAssumeCapacity(encoded_level);
-            encoded_levels.appendAssumeCapacity(encoded_level);
-        },
-        .rgba_f32 => for (raw_levels.constSlice()) |raw_level| {
-            encoded_levels.appendAssumeCapacity(std.mem.sliceAsBytes(raw_level.data));
-        },
-        .bc7 => |eo| {
-            // Determine the bc7 params
-            var params: Bc7Enc.Params = .{};
-            {
-                if (eo.uber_level > Bc7Enc.Params.max_uber_level) {
-                    log.err("Invalid uber level.", .{});
-                    return error.InvalidOption;
-                }
-                params.bc7_uber_level = eo.uber_level;
-
-                params.reduce_entropy = eo.reduce_entropy;
-
-                if (eo.max_partitions_to_scan > Bc7Enc.Params.max_partitions) {
-                    log.err("Invalid max partitions to scan.", .{});
-                    return error.InvalidOption;
-                }
-                params.max_partitions_to_scan = eo.max_partitions_to_scan;
-                // Ignored when using RDO. However, we use it in our bindings. The actual encoder
-                // just clears it so it doesn't matter that we set it regardless.
-                params.perceptual = eo.color_space == .srgb;
-                params.mode6_only = eo.mode_6_only;
-
-                if (options.max_threads) |v| {
-                    // XXX: check at top. why is 0 an error?
-                    if (v == 0) {
-                        log.err("Invalid max threads.", .{});
-                        return error.InvalidOption;
-                    }
-                    params.rdo_max_threads = v;
-                } else {
-                    params.rdo_max_threads = @intCast(std.math.clamp(
-                        std.Thread.getCpuCount() catch 1,
-                        1,
-                        std.math.maxInt(u32),
-                    ));
-                }
-                params.rdo_multithreading = params.rdo_max_threads > 1;
-
-                if (eo.rdo) |rdo| {
-                    if ((rdo.lambda < 0.0) or (rdo.lambda > 500.0)) {
-                        log.err("Invalid RDO lambda.", .{});
-                        return error.InvalidOption;
-                    }
-                    params.rdo_lambda = rdo.lambda;
-
-                    if (rdo.lookback_window) |lookback_window| {
-                        if (lookback_window < Bc7Enc.Params.min_lookback_window_size) {
-                            log.err("Invalid lookback window.", .{});
-                            return error.InvalidOption;
-                        }
-                        params.lookback_window_size = lookback_window;
-                        params.custom_lookback_window_size = true;
-                    }
-
-                    if (rdo.smooth_block_error_scale) |v| {
-                        if ((v < 1.0) or (v > 500.0)) {
-                            log.err("Invalid smooth block error scale.", .{});
-                            return error.InvalidOption;
-                        }
-                        params.rdo_smooth_block_error_scale = v;
-                        params.custom_rdo_smooth_block_error_scale = true;
-                    }
-
-                    params.rdo_bc7_quant_mode6_endpoints = rdo.quantize_mode_6_endpoints;
-                    params.rdo_bc7_weight_modes = rdo.weight_modes;
-                    params.rdo_bc7_weight_low_frequency_partitions = rdo.weight_low_frequency_partitions;
-                    params.rdo_bc7_pbit1_weighting = rdo.pbit1_weighting;
-
-                    if ((rdo.max_smooth_block_std_dev) < 0.000125 or (rdo.max_smooth_block_std_dev > 256.0)) {
-                        log.err("Invalid smooth block standard deviation.", .{});
-                        return error.InvalidOption;
-                    }
-                    params.rdo_max_smooth_block_std_dev = rdo.max_smooth_block_std_dev;
-                    params.rdo_try_2_matches = rdo.try_two_matches;
-                    params.rdo_ultrasmooth_block_handling = rdo.ultrasmooth_block_handling;
-                }
-            }
-
-            // Encode the levels
-            for (raw_levels.constSlice()) |raw_level| {
-                bc7_encoders.appendAssumeCapacity(Bc7Enc.init() orelse {
-                    return error.Bc7EncFailed;
-                });
-
-                const bc7_encoder = bc7_encoders.get(bc7_encoders.len - 1);
-
-                if (!bc7_encoder.encode(
-                    &params,
-                    raw_level.width,
-                    raw_level.height,
-                    raw_level.data.ptr,
-                )) {
-                    return error.Bc7EncFailed;
-                }
-
-                encoded_levels.appendAssumeCapacity(bc7_encoder.getBlocks());
-            }
-        },
+    for (raw_levels.constSlice()) |raw_level| {
+        encoded_levels.appendAssumeCapacity(try EncodedImage.init(
+            gpa,
+            raw_level,
+            options.max_threads,
+            options.encoding,
+        ));
     }
 
-    // XXX: pull out compression
+    // XXX: could do this on multiple threads, or file issue for this for post 1.0
     // Compress the data if needed
-    var compressed_levels: std.BoundedArray([]u8, Ktx2.max_levels) = .{};
-    switch (options.supercompression) {
-        .none => for (encoded_levels.constSlice()) |encoded_level| {
-            compressed_levels.appendAssumeCapacity(encoded_level);
-        },
-        .zlib => |zlib_options| for (encoded_levels.constSlice()) |level| {
-            var compressed = try ArrayListUnmanaged(u8).initCapacity(
-                gpa,
-                encoded_levels.constSlice()[0].len,
-            );
-            defer compressed.deinit(gpa);
-
-            const Compressor = std.compress.flate.deflate.Compressor(
-                .zlib,
-                @TypeOf(compressed).Writer,
-            );
-            var compressor = try Compressor.init(
-                compressed.writer(gpa),
-                .{ .level = zlib_options.level },
-            );
-            _ = try compressor.write(level);
-            try compressor.finish();
-            compressed_levels.appendAssumeCapacity(try compressed.toOwnedSlice(gpa));
-        },
-    }
-    defer if (options.supercompression != .none) for (compressed_levels.constSlice()) |compressed_level| {
-        gpa.free(compressed_level);
+    var compressed_levels: std.BoundedArray(CompressedImage, Ktx2.max_levels) = .{};
+    defer for (compressed_levels.constSlice()) |level| {
+        level.deinit(gpa);
     };
+    for (encoded_levels.constSlice()) |level_encoder| {
+        compressed_levels.appendAssumeCapacity(try CompressedImage.init(
+            gpa,
+            level_encoder.buf,
+            options.supercompression,
+        ));
+    }
 
-    // XXX: pull out writing
+    // XXX: pull out writing. we could make a type called texture that we append data too then
+    // it has a write function that writes it as ktx?
     // Write the header
     const samples: u8 = switch (options.encoding) {
         .rgba_u8, .rgba_f32 => 4,
@@ -775,7 +547,7 @@ pub fn createTexture(
                 byte_offset = std.mem.alignForward(usize, byte_offset, level_alignment);
                 const compressed_level = compressed_levels.get(compressed_levels.len - i - 1);
                 byte_offsets_reverse.appendAssumeCapacity(byte_offset);
-                byte_offset += compressed_level.len;
+                byte_offset += compressed_level.buf.len;
             }
         }
 
@@ -784,8 +556,8 @@ pub fn createTexture(
         for (0..compressed_levels.len) |i| {
             try writer.writeStruct(Ktx2.Level{
                 .byte_offset = byte_offsets_reverse.get(compressed_levels.len - i - 1),
-                .byte_length = compressed_levels.get(i).len,
-                .uncompressed_byte_length = encoded_levels.get(i).len,
+                .byte_length = compressed_levels.get(i).buf.len,
+                .uncompressed_byte_length = encoded_levels.get(i).buf.len,
             });
         }
     }
@@ -911,103 +683,8 @@ pub fn createTexture(
 
             // Write the level
             const compressed_level = compressed_levels.get(compressed_levels.len - i - 1);
-            try writer.writeAll(compressed_level);
-            byte_offset += compressed_level.len;
+            try writer.writeAll(compressed_level.buf);
+            byte_offset += compressed_level.buf.len;
         }
     }
 }
-
-const Bc7Enc = opaque {
-    const Params = extern struct {
-        const max_partitions = 64;
-        const max_uber_level = 4;
-        const max_level = 18;
-        const min_lookback_window_size = 8;
-
-        const Bc345ModeMask = enum(u32) {
-            const bc4_use_all_modes: @This() = .bc4_default_search_rad;
-
-            bc4_default_search_rad = 3,
-            bc4_use_mode8_flag = 1,
-            bc4_use_mode6_flag = 2,
-
-            _,
-        };
-
-        pub const Bc1ApproxMode = enum(c_uint) {
-            ideal = 0,
-            nvidia = 1,
-            amd = 2,
-            ideal_round_4 = 3,
-            _,
-        };
-
-        pub const DxgiFormat = enum(c_uint) {
-            bc7_unorm = 98,
-        };
-
-        bc7_uber_level: c_int = max_uber_level,
-        max_partitions_to_scan: c_int = max_partitions,
-        perceptual: bool = false,
-        bc45_channel0: u32 = 0,
-        bc45_channel1: u32 = 1,
-
-        bc1_mode: Bc1ApproxMode = .ideal,
-        use_bc1_3color_mode: bool = true,
-
-        use_bc1_3color_mode_for_black: bool = true,
-
-        bc1_quality_level: c_int = max_level,
-
-        dxgi_format: DxgiFormat = .bc7_unorm,
-
-        rdo_lambda: f32 = 0.0,
-        rdo_debug_output: bool = false,
-        rdo_smooth_block_error_scale: f32 = 15.0,
-        custom_rdo_smooth_block_error_scale: bool = false,
-        lookback_window_size: u32 = 128,
-        custom_lookback_window_size: bool = false,
-        rdo_bc7_quant_mode6_endpoints: bool = true,
-        rdo_bc7_weight_modes: bool = true,
-        rdo_bc7_weight_low_frequency_partitions: bool = true,
-        rdo_bc7_pbit1_weighting: bool = true,
-        rdo_max_smooth_block_std_dev: f32 = 18.0,
-        rdo_allow_relative_movement: bool = false,
-        rdo_try_2_matches: bool = true,
-        rdo_ultrasmooth_block_handling: bool = true,
-
-        use_hq_bc345: bool = true,
-        bc345_search_rad: c_int = 5,
-        bc345_mode_mask: Bc345ModeMask = Bc345ModeMask.bc4_use_all_modes,
-
-        mode6_only: bool = false,
-        rdo_multithreading: bool = true,
-
-        reduce_entropy: bool = false,
-
-        m_use_bc7e: bool = false,
-        status_output: bool = false,
-
-        rdo_max_threads: u32 = 128,
-    };
-
-    pub const init = bc7enc_init;
-    pub const deinit = bc7enc_deinit;
-    pub const encode = bc7enc_encode;
-    pub fn getBlocks(self: *@This()) []u8 {
-        const bytes = bc7enc_getTotalBlocksSizeInBytes(self);
-        return bc7enc_getBlocks(self)[0..bytes];
-    }
-
-    extern fn bc7enc_init() callconv(.C) ?*@This();
-    extern fn bc7enc_deinit(self: *@This()) callconv(.C) void;
-    extern fn bc7enc_encode(
-        self: *@This(),
-        params: *const Params,
-        width: u32,
-        height: u32,
-        pixels: [*]const f32,
-    ) callconv(.C) bool;
-    extern fn bc7enc_getBlocks(self: *@This()) callconv(.C) [*]u8;
-    extern fn bc7enc_getTotalBlocksSizeInBytes(self: *@This()) callconv(.C) u32;
-};

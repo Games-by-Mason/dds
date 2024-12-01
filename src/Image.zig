@@ -140,16 +140,29 @@ pub const AddressMode = enum(c_uint) {
 pub const Filter = enum(c_uint) {
     // XXX: link to issue 20
     // box = c.STBIR_FILTER_BOX,
-    triangle = c.STBIR_FILTER_TRIANGLE,
-    cubic_b_spline = c.STBIR_FILTER_CUBICBSPLINE,
-    catmull_rom = c.STBIR_FILTER_CATMULLROM,
-    mitchell = c.STBIR_FILTER_MITCHELL,
-    point_sample = c.STBIR_FILTER_POINT_SAMPLE,
+    default,
+    triangle,
+    cubic_b_spline,
+    catmull_rom,
+    mitchell,
+    point_sample,
 
-    pub fn sharpens(self: @This()) bool {
+    fn sharpens(self: @This(), hdr: bool) bool {
         return switch (self) {
+            .default => !hdr,
             .triangle, .point_sample, .cubic_b_spline => false,
             .mitchell, .catmull_rom => true,
+        };
+    }
+
+    fn toStbFilter(self: @This(), hdr: bool) c.stbir_filter {
+        return switch (self) {
+            .default => if (hdr) c.STBIR_FILTER_TRIANGLE else c.STBIR_FILTER_MITCHELL,
+            .triangle => c.STBIR_FILTER_TRIANGLE,
+            .cubic_b_spline => c.STBIR_FILTER_CUBICBSPLINE,
+            .catmull_rom => c.STBIR_FILTER_CATMULLROM,
+            .mitchell => c.STBIR_FILTER_MITCHELL,
+            .point_sample => c.STBIR_FILTER_POINT_SAMPLE,
         };
     }
 };
@@ -194,8 +207,8 @@ pub fn resize(self: Image, options: ResizeOptions) ResizeError!Image {
 
     stbr_options.horizontal_edge = @intFromEnum(options.address_mode_u);
     stbr_options.vertical_edge = @intFromEnum(options.address_mode_v);
-    stbr_options.horizontal_filter = @intFromEnum(options.filter_u);
-    stbr_options.vertical_filter = @intFromEnum(options.filter_v);
+    stbr_options.horizontal_filter = options.filter_u.toStbFilter(self.hdr);
+    stbr_options.vertical_filter = options.filter_v.toStbFilter(self.hdr);
 
     if (c.stbir_resize_extended(&stbr_options) != 1) {
         c.free(data.ptr);
@@ -204,7 +217,7 @@ pub fn resize(self: Image, options: ResizeOptions) ResizeError!Image {
 
     // Sharpening filters can push values below zero. Clamp them before doing further processing.
     // We could alternatively use `STBIR_FLOAT_LOW_CLAMP`, see issue #18.
-    if (options.filter_u.sharpens() or options.filter_v.sharpens()) {
+    if (options.filter_u.sharpens(self.hdr) or options.filter_v.sharpens(self.hdr)) {
         for (data) |*d| {
             d.* = @max(d.*, 0.0);
         }
