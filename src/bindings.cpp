@@ -3,6 +3,7 @@
 #include <bc7enc/utils.h>
 
 #define STB_IMAGE_IMPLEMENTATION
+#define STBI_NO_FAILURE_STRINGS
 #include "stb_image.h"
 
 #define STB_IMAGE_RESIZE_IMPLEMENTATION

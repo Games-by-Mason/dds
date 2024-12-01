@@ -23,6 +23,19 @@ const Alpha = enum {
     premultiplied,
 };
 
+pub const Filter = enum(c_uint) {
+    box = @intFromEnum(Image.ResizeOptions.Filter.box),
+    triangle = @intFromEnum(Image.ResizeOptions.Filter.triangle),
+    @"cubic-b-spline" = @intFromEnum(Image.ResizeOptions.Filter.cubic_b_spline),
+    @"catmull-rom" = @intFromEnum(Image.ResizeOptions.Filter.catmull_rom),
+    mitchell = @intFromEnum(Image.ResizeOptions.Filter.mitchell),
+    @"point-sample" = @intFromEnum(Image.ResizeOptions.Filter.point_sample),
+
+    pub fn filter(self: @This()) Image.ResizeOptions.Filter {
+        return @enumFromInt(@intFromEnum(self));
+    }
+};
+
 const ZlibLevel = enum(u4) {
     const StdLevel = std.compress.flate.deflate.Level;
 
@@ -75,17 +88,17 @@ const command: Command = .{
             .long = "preserve-alpha-coverage-max-steps",
             .default = .{ .value = 10 },
         }),
-        NamedArg.init(?Image.ResizeOptions.Filter, .{
+        NamedArg.init(?Filter, .{
             .description = "defaults to the mitchell filter for LDR images, box for HDR images",
             .long = "filter",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.ResizeOptions.Filter, .{
+        NamedArg.init(?Filter, .{
             .description = "overrides --filter in the U direction",
             .long = "filter-u",
             .default = .{ .value = null },
         }),
-        NamedArg.init(?Image.ResizeOptions.Filter, .{
+        NamedArg.init(?Filter, .{
             .description = "overrides --filter in the V direction",
             .long = "filter-v",
             .default = .{ .value = null },
@@ -302,7 +315,7 @@ pub fn main() !void {
 
     const maybe_address_mode_u = args.named.@"address-mode-u" orelse args.named.@"address-mode";
     const maybe_address_mode_v = args.named.@"address-mode-v" orelse args.named.@"address-mode";
-    const default_filter: Image.ResizeOptions.Filter = if (original.hdr) .box else .mitchell;
+    const default_filter: Filter = if (original.hdr) .box else .mitchell;
     const filter_u = args.named.@"filter-u" orelse args.named.filter orelse default_filter;
     const filter_v = args.named.@"filter-v" orelse args.named.filter orelse default_filter;
     if (filter_u == .box and maybe_address_mode_u != null and maybe_address_mode_u != .clamp) {
@@ -319,14 +332,14 @@ pub fn main() !void {
     // Sharpening filters can cause extreme artifacts on HDR images. See #15 for more
     // information.
     if (original.hdr) {
-        if (filter_u.sharpens()) {
+        if (filter_u.filter().sharpens()) {
             log.err(
                 "{s}: {s} filter applies sharpening, is not compatible with HDR images",
                 .{ args.positional.INPUT, @tagName(filter_u) },
             );
             std.process.exit(1);
         }
-        if (filter_v.sharpens()) {
+        if (filter_v.filter().sharpens()) {
             log.err(
                 "{s}: {s} filter applies sharpening, is not compatible with HDR images",
                 .{ args.positional.INPUT, @tagName(filter_v) },
@@ -372,19 +385,27 @@ pub fn main() !void {
                 .height = height,
                 .address_mode_u = address_mode_u,
                 .address_mode_v = address_mode_v,
-                .filter_u = filter_u,
-                .filter_v = filter_v,
-            }) orelse {
-                log.err("{s}: resize failed", .{args.positional.INPUT});
-                std.process.exit(1);
+                .filter_u = filter_u.filter(),
+                .filter_v = filter_v.filter(),
+            }) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    log.err("{s}: out of memory", .{args.positional.INPUT});
+                    std.process.exit(1);
+                },
+                error.StbResizeFailure => {
+                    log.err("{s}: STB resize failed", .{args.positional.INPUT});
+                    std.process.exit(1);
+                },
             };
             raw_levels.appendAssumeCapacity(scaled);
         } else {
             // We can elide this copy if it ends up being a perf/memory issue, for now it's
             // convenient since we may use it to calculate coverage later.
-            raw_levels.appendAssumeCapacity(original.copy() orelse {
-                log.err("{s}: out of memory", .{args.positional.INPUT});
-                std.process.exit(1);
+            raw_levels.appendAssumeCapacity(original.copy() catch |err| switch (err) {
+                error.OutOfMemory => {
+                    log.err("{s}: out of memory", .{args.positional.INPUT});
+                    std.process.exit(1);
+                },
             });
         }
     }
@@ -408,12 +429,21 @@ pub fn main() !void {
         var generate_mipmaps = raw_levels.get(0).generateMipmaps(.{
             .address_mode_u = address_mode_u,
             .address_mode_v = address_mode_v,
-            .filter_u = filter_u,
-            .filter_v = filter_v,
+            .filter_u = filter_u.filter(),
+            .filter_v = filter_v.filter(),
             .block_size = block_size,
         });
 
-        while (generate_mipmaps.next()) |mipmap| {
+        while (generate_mipmaps.next() catch |err| switch (err) {
+            error.OutOfMemory => {
+                log.err("{s}: out of memory", .{args.positional.INPUT});
+                std.process.exit(1);
+            },
+            error.StbResizeFailure => {
+                log.err("{s}: resize failed", .{args.positional.INPUT});
+                std.process.exit(1);
+            },
+        }) |mipmap| {
             raw_levels.appendAssumeCapacity(mipmap);
         }
     }
