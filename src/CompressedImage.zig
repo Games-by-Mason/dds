@@ -1,7 +1,5 @@
 pub const std = @import("std");
 
-pub const Ktx2 = @import("Ktx2");
-
 pub const Error = error{
     OutOfMemory,
     // XXX: ?? remove from parent if remove here
@@ -17,14 +15,13 @@ pub const Options = union(enum) {
     none: void,
 };
 
-// XXX: in header vs move to root?
-scheme: Ktx2.Header.SupercompressionScheme,
+owned: bool,
 buf: []const u8,
 
 pub fn init(gpa: std.mem.Allocator, bytes: []const u8, options: Options) Error!@This() {
     switch (options) {
         .none => return .{
-            .scheme = .none,
+            .owned = false,
             .buf = bytes,
         },
         .zlib => |zlib_options| {
@@ -46,7 +43,7 @@ pub fn init(gpa: std.mem.Allocator, bytes: []const u8, options: Options) Error!@
             try compressor.finish();
 
             return .{
-                .scheme = .zlib,
+                .owned = true,
                 .buf = try compressed.toOwnedSlice(gpa),
             };
         },
@@ -54,8 +51,5 @@ pub fn init(gpa: std.mem.Allocator, bytes: []const u8, options: Options) Error!@
 }
 
 pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
-    switch (self.scheme) {
-        .none => {},
-        else => gpa.free(self.buf),
-    }
+    if (self.owned) gpa.free(self.buf);
 }

@@ -9,13 +9,47 @@ pub const Error = error{
     EncoderFailed,
 };
 
-pub const Options = union(enum) {
-    pub const Rgba8 = struct {
-        color_space: enum { srgb, linear },
-    };
+pub const Encoding = enum {
+    rgba_u8,
+    rgba_srgb_u8,
+    rgba_f32,
+    bc7,
+    bc7_srgb,
+
+    pub fn samples(self: @This()) u8 {
+        return switch (self) {
+            .rgba_u8, .rgba_srgb_u8, .rgba_f32 => 4,
+            .bc7, .bc7_srgb => 1,
+        };
+    }
+
+    pub fn blockSize(self: @This()) u8 {
+        return switch (self) {
+            .rgba_u8, .rgba_srgb_u8, .rgba_f32 => 1,
+            .bc7, .bc7_srgb => 4,
+        };
+    }
+
+    pub fn colorSpace(self: @This()) Image.ColorSpace {
+        return switch (self) {
+            .bc7, .rgba_u8 => .linear,
+            .bc7_srgb, .rgba_srgb_u8 => .srgb,
+            .rgba_f32 => .hdr,
+        };
+    }
+
+    pub fn typeSize(self: @This()) u8 {
+        return switch (self) {
+            .rgba_u8, .rgba_srgb_u8, .bc7, .bc7_srgb => 1,
+            .rgba_f32 => 4,
+        };
+    }
+};
+
+pub const Options = union(Encoding) {
+    pub const Rgba8 = struct {};
     pub const RgbaF32 = struct {};
     pub const Bc7 = struct {
-        color_space: enum { srgb, linear },
         uber_level: u8 = Bc7Enc.Params.max_uber_level,
         reduce_entropy: bool = false,
         max_partitions_to_scan: u16 = Bc7Enc.Params.max_partitions,
@@ -35,25 +69,10 @@ pub const Options = union(enum) {
     };
 
     rgba_u8: Rgba8,
+    rgba_srgb_u8: Rgba8,
     rgba_f32: RgbaF32,
     bc7: Bc7,
-
-    pub fn blockSize(self: @This()) u8 {
-        return switch (self) {
-            .rgba_u8, .rgba_f32 => 1,
-            .bc7 => 4,
-        };
-    }
-
-    pub fn colorSpace(self: @This()) Image.ColorSpace {
-        return switch (self) {
-            inline .bc7, .rgba_u8 => |ec| switch (ec.color_space) {
-                .srgb => .srgb,
-                .linear => .linear,
-            },
-            .rgba_f32 => .hdr,
-        };
-    }
+    bc7_srgb: Bc7,
 };
 
 bc7_encoder: ?*Bc7Enc = null,
@@ -69,12 +88,13 @@ pub fn init(
     max_threads: ?u16,
     options: Options,
 ) Error!@This() {
+    const encoding: Encoding = options;
     switch (options) {
-        .rgba_u8 => |eo| {
+        .rgba_u8, .rgba_srgb_u8 => {
             const buf = try gpa.alloc(u8, image.data.len);
             for (0..@as(usize, image.width) * @as(usize, image.height) * 4) |i| {
                 var ldr = image.data[i];
-                if (eo.color_space == .srgb and i % 4 != 3) {
+                if (encoding.colorSpace() == .srgb and i % 4 != 3) {
                     ldr = std.math.pow(f32, ldr, 1.0 / 2.2);
                 }
                 ldr = std.math.clamp(ldr * 255.0 + 0.5, 0.0, 255.0);
@@ -89,7 +109,7 @@ pub fn init(
             .buf = std.mem.sliceAsBytes(image.data),
             .owned = false,
         },
-        .bc7 => |eo| {
+        .bc7, .bc7_srgb => |eo| {
             // Determine the bc7 params
             var params: Bc7Enc.Params = .{};
             {
@@ -108,7 +128,7 @@ pub fn init(
                 params.max_partitions_to_scan = eo.max_partitions_to_scan;
                 // Ignored when using RDO. However, we use it in our bindings. The actual encoder
                 // just clears it so it doesn't matter that we set it regardless.
-                params.perceptual = eo.color_space == .srgb;
+                params.perceptual = encoding.colorSpace() == .srgb;
                 params.mode6_only = eo.mode_6_only;
 
                 if (max_threads) |v| {
