@@ -9,6 +9,11 @@ const zex = @import("zex");
 const Image = zex.Image;
 const EncodedImage = zex.EncodedImage;
 
+pub const tracy = @import("tracy");
+pub const tracy_impl = @import("tracy_impl");
+
+const Zone = tracy.Zone;
+
 const ColorSpace = enum {
     linear,
     srgb,
@@ -230,6 +235,12 @@ const rdo_command: Command = .{
 };
 
 pub fn main() !void {
+    // Tracy
+    const zone = Zone.begin(.{ .src = @src() });
+    defer zone.end();
+    tracy.frameMarkStart("main");
+    tracy.appInfo("Zex");
+
     // Setup
     defer std.process.cleanExit();
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
@@ -302,7 +313,6 @@ pub fn main() !void {
             },
             .@"rgba-f32" => .rgba_f32,
         },
-        // XXX: ...
         .filter_u = switch (args.named.@"filter-u" orelse args.named.filter orelse @panic("unimplemented")) {
             .triangle => .triangle,
             .@"cubic-b-spline" => .cubic_b_spline,
@@ -310,7 +320,6 @@ pub fn main() !void {
             .mitchell => .mitchell,
             .@"point-sample" => .point_sample,
         },
-        // XXX: ...
         .filter_v = switch (args.named.@"filter-v" orelse args.named.filter orelse @panic("unimplemented")) {
             .triangle => .triangle,
             .@"cubic-b-spline" => .cubic_b_spline,
@@ -318,11 +327,6 @@ pub fn main() !void {
             .mitchell => .mitchell,
             .@"point-sample" => .point_sample,
         },
-        // XXX: it should be possible to set a default for a lot of settings globally, and then override
-        // them per texture. e.g. you may want to just say "supercompress all assets" but then you may
-        // also want to override the options per asset. you may also want to change this in different build
-        // modes, e.g. it may not be worth it to wait for supercompression during hot swaps.
-        // similar tradeoffs for threads.
         .max_threads = args.named.@"max-threads",
         .generate_mipmaps = args.named.@"generate-mipmaps",
         .alpha_test = if (args.named.@"preserve-alpha-coverage") |t| .{

@@ -1,8 +1,14 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    // Build options
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const tracy_enabled = b.option(
+        bool,
+        "tracy",
+        "Build with Tracy support.",
+    ) orelse false;
 
     // Fetch dependencies
     const bc7enc = b.dependency("bc7enc_rdo", .{});
@@ -67,7 +73,13 @@ pub fn build(b: *std.Build) void {
     bindings.installHeadersDirectory(stb.path("."), "", .{});
     bindings.linkLibrary(libbc7enc);
 
-    // Build zex
+    // Build Tracy
+    const tracy = b.dependency("tracy", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Build Zex
     const zex = b.addModule("zex", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -75,6 +87,7 @@ pub fn build(b: *std.Build) void {
     });
     zex.addImport("Ktx2", ktx2);
     zex.linkLibrary(bindings);
+    zex.addImport("tracy", tracy.module("tracy"));
 
     // Build the command line tool
     const zex_exe = b.addExecutable(.{
@@ -85,6 +98,14 @@ pub fn build(b: *std.Build) void {
     });
     zex_exe.root_module.addImport("zex", zex);
     zex_exe.root_module.addImport("structopt", structopt.module("structopt"));
+
+    zex_exe.root_module.addImport("tracy", tracy.module("tracy"));
+    if (tracy_enabled) {
+        zex_exe.root_module.addImport("tracy_impl", tracy.module("tracy_impl_enabled"));
+    } else {
+        zex_exe.root_module.addImport("tracy_impl", tracy.module("tracy_impl_disabled"));
+    }
+
     b.installArtifact(zex_exe);
 
     // Create the run command

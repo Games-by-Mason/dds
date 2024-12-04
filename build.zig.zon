@@ -16,6 +16,10 @@
             .url = "https://github.com/nothings/stb/archive/5c205738c191bcb0abc65c4febfa9bd25ff35234.tar.gz",
             .hash = "122082911aadaef3c836d3833f7c60386ee1ee46feffb6c54785f784801c32212aaa",
         },
+        .tracy = .{
+            .url = "https://github.com/Games-by-Mason/tracy_zig/archive/2fcfcd30adb365bb649ca1e818a039d96aa36e73.tar.gz",
+            .hash = "122023643989be5ea73d3bf0f307b84505ddd913edb5cf015361e4016cb9270c04b6",
+        },
     },
     .paths = .{
         "build.zig",

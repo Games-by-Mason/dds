@@ -11,13 +11,13 @@ const std = @import("std");
 const assert = std.debug.assert;
 const log = std.log;
 const c = @import("c.zig");
+const tracy = @import("tracy");
+const Zone = tracy.Zone;
 
 const Image = @This();
 
 const max_file_len = 4294967296;
 
-// XXX: store address mode here? reflect in ktx somehow even just as extra metadata in
-// key value pairs? we could also store things like cutout threshold. idk.
 width: u32,
 height: u32,
 data: []f32,
@@ -42,10 +42,16 @@ pub fn read(
     reader: anytype,
     color_space: ColorSpace,
 ) (@TypeOf(reader).Error || error{ StreamTooLong, OutOfMemory } || InitError)!Image {
-    // XXX: ...in either case, do we want a buffered reader?
+    const zone = Zone.begin(.{ .src = @src() });
+    defer zone.end();
+
     // We could pass the reader into STB for additional pipelining and reduced allocations. For
     // simplicity's sake we don't do this yet, but we keep our options open by taking a reader.
-    const input_bytes = try reader.readAllAlloc(gpa, max_file_len);
+    const input_bytes = b: {
+        const read_zone = Zone.begin(.{ .name = "read", .src = @src() });
+        defer read_zone.end();
+        break :b try reader.readAllAlloc(gpa, max_file_len);
+    };
     defer gpa.free(input_bytes);
 
     // Check if the input is HDR
@@ -83,14 +89,18 @@ pub fn read(
     var width: c_int = 0;
     var height: c_int = 0;
     var input_channels: c_int = 0;
-    const data_ptr = c.stbi_loadf_from_memory(
-        input_bytes.ptr,
-        @intCast(input_bytes.len),
-        &width,
-        &height,
-        &input_channels,
-        4,
-    ) orelse return error.StbImageFailure;
+    const data_ptr = b: {
+        const read_zone = Zone.begin(.{ .name = "stbi_loadf_from_memory", .src = @src() });
+        defer read_zone.end();
+        break :b c.stbi_loadf_from_memory(
+            input_bytes.ptr,
+            @intCast(input_bytes.len),
+            &width,
+            &height,
+            &input_channels,
+            4,
+        ) orelse return error.StbImageFailure;
+    };
 
     // Create the image
     const data_len = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
@@ -103,10 +113,14 @@ pub fn read(
 }
 
 pub fn deinit(self: Image) void {
+    const zone = Zone.begin(.{ .src = @src() });
+    defer zone.end();
     c.stbi_image_free(self.data.ptr);
 }
 
 pub fn premultiply(self: Image) void {
+    const zone = Zone.begin(.{ .src = @src() });
+    defer zone.end();
     var px: usize = 0;
     while (px < @as(usize, self.width) * @as(usize, self.height) * 4) : (px += 4) {
         const a = self.data[px + 3];
@@ -117,6 +131,8 @@ pub fn premultiply(self: Image) void {
 }
 
 pub fn copy(self: Image) error{OutOfMemory}!Image {
+    const zone = Zone.begin(.{ .src = @src() });
+    defer zone.end();
     const data_ptr: [*]f32 = @ptrCast(@alignCast(c.malloc(
         self.data.len * @sizeOf(f32),
     ) orelse return error.OutOfMemory));
@@ -138,7 +154,7 @@ pub const AddressMode = enum(c_uint) {
 };
 
 pub const Filter = enum(c_uint) {
-    // XXX: link to issue 20
+    // See https://github.com/Games-by-Mason/Zex/issues/20
     // box = c.STBIR_FILTER_BOX,
     default,
     triangle,
@@ -179,6 +195,8 @@ pub const ResizeOptions = struct {
 };
 
 pub fn resize(self: Image, options: ResizeOptions) ResizeError!Image {
+    const zone = Zone.begin(.{ .src = @src() });
+    defer zone.end();
     assert(options.width > 0 and options.height > 0);
 
     if (options.width == self.width and options.height == self.height) return self.copy();
@@ -210,14 +228,20 @@ pub fn resize(self: Image, options: ResizeOptions) ResizeError!Image {
     stbr_options.horizontal_filter = options.filter_u.toStbFilter(self.hdr);
     stbr_options.vertical_filter = options.filter_v.toStbFilter(self.hdr);
 
-    if (c.stbir_resize_extended(&stbr_options) != 1) {
-        c.free(data.ptr);
-        return error.StbResizeFailure;
+    {
+        const resize_zone = Zone.begin(.{ .name = "stbir_resize_extended", .src = @src() });
+        defer resize_zone.end();
+        if (c.stbir_resize_extended(&stbr_options) != 1) {
+            c.free(data.ptr);
+            return error.StbResizeFailure;
+        }
     }
 
     // Sharpening filters can push values below zero. Clamp them before doing further processing.
     // We could alternatively use `STBIR_FLOAT_LOW_CLAMP`, see issue #18.
     if (options.filter_u.sharpens(self.hdr) or options.filter_v.sharpens(self.hdr)) {
+        const clamp_zone = Zone.begin(.{ .name = "clamp", .src = @src() });
+        defer clamp_zone.end();
         for (data) |*d| {
             d.* = @max(d.*, 0.0);
         }
@@ -242,6 +266,9 @@ pub const ResizeToFitOptions = struct {
 };
 
 pub fn resizeToFit(self: Image, options: ResizeToFitOptions) ResizeError!Image {
+    const resize_zone = Zone.begin(.{ .src = @src() });
+    defer resize_zone.end();
+
     const self_width_f: f64 = @floatFromInt(self.width);
     const self_height_f: f64 = @floatFromInt(self.height);
 
@@ -309,6 +336,9 @@ pub const GenerateMipmaps = struct {
 };
 
 pub fn alphaCoverage(self: Image, threshold: f32, scale: f32) f32 {
+    const zone = Zone.begin(.{ .src = @src() });
+    defer zone.end();
+
     // Quantize the threshold to the output type
     const quantized_threshold = if (self.hdr) threshold else @round(threshold * 255.0) / 255.0;
 
@@ -328,37 +358,44 @@ pub const PreserveAlphaCoverageOptions = struct {
     threshold: f32,
 };
 
-// XXX: could we make less steps if we know that the output is quantized? or at least stop
-// earlier?
 pub fn preserveAlphaCoverage(self: Image, options: PreserveAlphaCoverageOptions) void {
+    const zone = Zone.begin(.{ .src = @src() });
+    defer zone.end();
+
     // Binary search for the best scale parameter
     var best_scale: f32 = 1.0;
     var best_dist = std.math.inf(f32);
     var upper_threshold: f32 = 1.0;
     var lower_threshold: f32 = 0.0;
     var curr_threshold: f32 = options.threshold;
-    for (0..options.max_steps) |_| {
-        const curr_scale = options.threshold / curr_threshold;
-        const coverage = self.alphaCoverage(options.threshold, curr_scale);
-        const dist_to_coverage = @abs(coverage - options.coverage);
-        if (dist_to_coverage < best_dist) {
-            best_dist = dist_to_coverage;
-            best_scale = curr_scale;
-        }
+    {
+        const search_zone = Zone.begin(.{ .name = "search", .src = @src() });
+        defer search_zone.end();
+        for (0..options.max_steps) |_| {
+            const curr_scale = options.threshold / curr_threshold;
+            const coverage = self.alphaCoverage(options.threshold, curr_scale);
+            const dist_to_coverage = @abs(coverage - options.coverage);
+            if (dist_to_coverage < best_dist) {
+                best_dist = dist_to_coverage;
+                best_scale = curr_scale;
+            }
 
-        if (coverage < options.coverage) {
-            upper_threshold = curr_threshold;
-        } else if (coverage > options.coverage) {
-            lower_threshold = curr_threshold;
-        } else {
-            break;
-        }
+            if (coverage < options.coverage) {
+                upper_threshold = curr_threshold;
+            } else if (coverage > options.coverage) {
+                lower_threshold = curr_threshold;
+            } else {
+                break;
+            }
 
-        curr_threshold = (lower_threshold + upper_threshold) / 2.0;
+            curr_threshold = (lower_threshold + upper_threshold) / 2.0;
+        }
     }
 
     // Apply the scaling
     if (best_scale != 1.0) {
+        const search_zone = Zone.begin(.{ .name = "scale", .src = @src() });
+        defer search_zone.end();
         for (0..@as(usize, self.width) * @as(usize, self.height)) |i| {
             const a = &self.data[i * 4 + 3];
             a.* = @min(a.* * best_scale, 1.0);

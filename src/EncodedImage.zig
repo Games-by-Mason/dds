@@ -1,5 +1,7 @@
 const std = @import("std");
 const log = std.log;
+const tracy = @import("tracy");
+const Zone = tracy.Zone;
 
 const Image = @import("Image.zig");
 
@@ -79,19 +81,27 @@ bc7_encoder: ?*Bc7Enc = null,
 owned: bool,
 buf: []u8,
 
-// XXX: rename to Encoded or something? same for compressor? EncodedImage? not texture cause
-// texture has more levels possibly etc
 pub fn init(
     gpa: std.mem.Allocator,
     image: Image,
-    // XXX: ...
     max_threads: ?u16,
     options: Options,
 ) Error!@This() {
+    const search_zone = Zone.begin(.{ .src = @src() });
+    defer search_zone.end();
+
     const encoding: Encoding = options;
     switch (options) {
         .rgba_u8, .rgba_srgb_u8 => {
-            const buf = try gpa.alloc(u8, image.data.len);
+            const u8_zone = Zone.begin(.{ .name = "u8", .src = @src() });
+            defer u8_zone.end();
+            const buf = b: {
+                const alloc_zone = Zone.begin(.{ .name = "alloc", .src = @src() });
+                defer alloc_zone.end();
+                break :b try gpa.alloc(u8, image.data.len);
+            };
+            const encode_zone = Zone.begin(.{ .name = "encode", .src = @src() });
+            defer encode_zone.end();
             for (0..@as(usize, image.width) * @as(usize, image.height) * 4) |i| {
                 var ldr = image.data[i];
                 if (encoding.colorSpace() == .srgb and i % 4 != 3) {
@@ -110,9 +120,15 @@ pub fn init(
             .owned = false,
         },
         .bc7, .bc7_srgb => |eo| {
+            const bc7_zone = Zone.begin(.{ .name = "bc7", .src = @src() });
+            defer bc7_zone.end();
+
             // Determine the bc7 params
             var params: Bc7Enc.Params = .{};
             {
+                const params_zone = Zone.begin(.{ .name = "params", .src = @src() });
+                defer params_zone.end();
+
                 if (eo.uber_level > Bc7Enc.Params.max_uber_level) {
                     log.err("Invalid uber level.", .{});
                     return error.InvalidOption;
@@ -132,7 +148,6 @@ pub fn init(
                 params.mode6_only = eo.mode_6_only;
 
                 if (max_threads) |v| {
-                    // XXX: check at top. why is 0 an error?
                     if (v == 0) {
                         log.err("Invalid max threads.", .{});
                         return error.InvalidOption;
@@ -188,10 +203,18 @@ pub fn init(
             }
 
             // Encode the image
-            const bc7_encoder = Bc7Enc.init() orelse return error.EncoderFailed;
+            const bc7_encoder = b: {
+                const init_zone = Zone.begin(.{ .name = "init", .src = @src() });
+                defer init_zone.end();
+                break :b Bc7Enc.init() orelse return error.EncoderFailed;
+            };
 
-            if (!bc7_encoder.encode(&params, image.width, image.height, image.data.ptr)) {
-                return error.EncoderFailed;
+            {
+                const encode_zone = Zone.begin(.{ .name = "encode", .src = @src() });
+                defer encode_zone.end();
+                if (!bc7_encoder.encode(&params, image.width, image.height, image.data.ptr)) {
+                    return error.EncoderFailed;
+                }
             }
 
             return .{
@@ -204,19 +227,14 @@ pub fn init(
 }
 
 pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
+    const zone = Zone.begin(.{ .src = @src() });
+    defer zone.end();
     if (self.owned) gpa.free(self.buf);
     if (self.bc7_encoder) |b| b.deinit();
 }
 
-// XXX: hmm, problem is like, ideally we just want the options for this to be the encoding struct.
-// but things like filters don't matter here. they're only on that because of the defaults. we can
-// just make a filter called default that picks the right one.
-
-// XXX: make private
 pub const Bc7Enc = opaque {
-    // XXX: make private
     pub const Params = extern struct {
-        // XXX: make private
         pub const max_partitions = 64;
         pub const max_uber_level = 4;
         pub const max_level = 18;
