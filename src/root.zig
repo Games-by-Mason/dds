@@ -59,25 +59,32 @@ pub fn createTexture(
     // Get the encoding tag
     const encoding: EncodedImage.Encoding = options.encoding;
 
-    // Load the image.
-    const original = try Image.read(gpa, reader, encoding.colorSpace());
-    defer original.deinit();
-
-    // Premultiply alpha if it represents transparency.
-    if (options.alpha_is_transparency) original.premultiply();
-
     // Create an array of mip levels.
     var raw_levels: std.BoundedArray(Image, Ktx2.max_levels) = .{};
     defer for (raw_levels.constSlice()[1..]) |level| {
         level.deinit();
     };
 
-    // Copy the original to mip levels, resizing if needed. This results in an unnecessary copy in
-    // some cases, but greatly simplifies the control flow.
-    {
+    // Generate the first level of the mip
+    const alpha_coverage = b: {
         const first_level_zone = Zone.begin(.{ .name = "first level", .src = @src() });
         defer first_level_zone.end();
-        raw_levels.appendAssumeCapacity(try original.resizeToFit(.{
+
+        // Load the image.
+        var image = try Image.read(gpa, reader, encoding.colorSpace());
+        errdefer image.deinit();
+
+        // Premultiply alpha if it represents transparency.
+        if (options.alpha_is_transparency) image.premultiply();
+
+        // Calculate the alpha coverage if requested
+        const alpha_coverage = if (options.alpha_test) |alpha_test|
+            image.alphaCoverage(alpha_test.threshold, 1.0)
+        else
+            null;
+
+        // Resize the image if requested
+        try image.resizeToFit(.{
             .max_size = options.max_size,
             .max_width = options.max_width,
             .max_height = options.max_height,
@@ -85,8 +92,14 @@ pub fn createTexture(
             .address_mode_v = options.address_mode_v,
             .filter_u = options.filterU(),
             .filter_v = options.filterV(),
-        }));
-    }
+        });
+
+        // Store the first mip level
+        raw_levels.appendAssumeCapacity(image);
+
+        // Break with the alpha coverage
+        break :b alpha_coverage;
+    };
 
     // Generate any other requested mipmaps.
     if (options.generate_mipmaps) {
@@ -111,11 +124,10 @@ pub fn createTexture(
     if (options.alpha_test) |alpha_test| {
         const mipmap_zone = Zone.begin(.{ .name = "alpha test", .src = @src() });
         defer mipmap_zone.end();
-        const coverarage = original.alphaCoverage(alpha_test.threshold, 1.0);
         for (raw_levels.constSlice()) |level| {
             level.preserveAlphaCoverage(.{
                 .threshold = alpha_test.threshold,
-                .coverage = coverarage,
+                .coverage = alpha_coverage.?, // Always present if alpha test is set
                 .max_steps = alpha_test.max_steps,
             });
         }

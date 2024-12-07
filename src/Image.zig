@@ -194,7 +194,7 @@ pub const ResizeOptions = struct {
     filter_v: Filter,
 };
 
-pub fn resize(self: Image, options: ResizeOptions) ResizeError!Image {
+pub fn resized(self: Image, options: ResizeOptions) ResizeError!Image {
     const zone = Zone.begin(.{ .src = @src() });
     defer zone.end();
     assert(options.width > 0 and options.height > 0);
@@ -255,19 +255,25 @@ pub fn resize(self: Image, options: ResizeOptions) ResizeError!Image {
     };
 }
 
-pub const ResizeToFitOptions = struct {
+pub fn resize(self: *Image, options: ResizeOptions) ResizeError!void {
+    const zone = Zone.begin(.{ .src = @src() });
+    defer zone.end();
+    if (self.width != options.width or self.height != options.height) {
+        const result = try self.resized(options);
+        self.deinit();
+        self.* = result;
+    }
+}
+
+pub const SizeToFitOptions = struct {
     max_size: u32 = std.math.maxInt(u32),
     max_width: u32 = std.math.maxInt(u32),
     max_height: u32 = std.math.maxInt(u32),
-    address_mode_u: AddressMode,
-    address_mode_v: AddressMode,
-    filter_u: Filter,
-    filter_v: Filter,
 };
 
-pub fn resizeToFit(self: Image, options: ResizeToFitOptions) ResizeError!Image {
-    const resize_zone = Zone.begin(.{ .src = @src() });
-    defer resize_zone.end();
+pub fn sizeToFit(self: Image, options: SizeToFitOptions) struct { u32, u32 } {
+    const zone = Zone.begin(.{ .src = @src() });
+    defer zone.end();
 
     const self_width_f: f64 = @floatFromInt(self.width);
     const self_height_f: f64 = @floatFromInt(self.height);
@@ -285,7 +291,44 @@ pub fn resizeToFit(self: Image, options: ResizeToFitOptions) ResizeError!Image {
     const width = @min(@as(u32, @intFromFloat(scale * self_width_f)), max_width);
     const height = @min(@as(u32, @intFromFloat(scale * self_height_f)), max_height);
 
-    return self.resize(.{
+    return .{ width, height };
+}
+
+pub const ResizeToFitOptions = struct {
+    max_size: u32 = std.math.maxInt(u32),
+    max_width: u32 = std.math.maxInt(u32),
+    max_height: u32 = std.math.maxInt(u32),
+    address_mode_u: AddressMode,
+    address_mode_v: AddressMode,
+    filter_u: Filter,
+    filter_v: Filter,
+};
+
+pub fn resizeToFit(self: *Image, options: ResizeToFitOptions) ResizeError!void {
+    const width, const height = self.sizeToFit(.{
+        .max_size = options.max_size,
+        .max_width = options.max_width,
+        .max_height = options.max_height,
+    });
+
+    try self.resize(.{
+        .width = width,
+        .height = height,
+        .address_mode_u = options.address_mode_u,
+        .address_mode_v = options.address_mode_v,
+        .filter_u = options.filter_u,
+        .filter_v = options.filter_v,
+    });
+}
+
+pub fn resizedToFit(self: Image, options: ResizeToFitOptions) ResizeError!Image {
+    const width, const height = self.sizeToFit(.{
+        .max_size = options.max_size,
+        .max_width = options.max_width,
+        .max_height = options.max_height,
+    });
+
+    return self.resized(.{
         .width = width,
         .height = height,
         .address_mode_u = options.address_mode_u,
@@ -323,7 +366,7 @@ pub const GenerateMipmaps = struct {
         }
 
         // Halve the image size
-        self.image = try self.image.resize(.{
+        self.image = try self.image.resized(.{
             .width = @max(1, self.image.width / 2),
             .height = @max(1, self.image.height / 2),
             .address_mode_u = self.options.address_mode_u,
