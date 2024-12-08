@@ -63,3 +63,12 @@ I recommend [Tacent View](https://github.com/bluescan/tacentview) for inspecting
 ## Zex is a work in progress
 
 Planned features for 1.0 can be found [here](https://github.com/Games-by-Mason/Zex/milestone/1).
+
+# WIP
+* [ ] Working on avoiding unnecessary copies by making these managed type with allocators, the idea is that we can make sorta dummy allocators for stb/c++ stuff
+	* [ ] Clean up XXXs
+	* [ ] Did it for everything except for CompressedImage, need to forward it through to there too
+	* [ ] Then verify that there are NO unnecessary copies since I think we can achieve that now
+* [ ] Then we can make our API more flexible by returning a texture instead of processing it internally
+	* Can maybe move the function that creates it onto texture as like init
+* [ ] Then revisit PR/issue notes
