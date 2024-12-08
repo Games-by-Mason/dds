@@ -7,12 +7,11 @@ const NamedArg = structopt.NamedArg;
 const PositionalArg = structopt.PositionalArg;
 const zex = @import("zex");
 const Image = zex.Image;
-const EncodedImage = zex.EncodedImage;
-
 pub const tracy = @import("tracy");
 pub const tracy_impl = @import("tracy_impl");
-
 const Zone = tracy.Zone;
+
+const max_file_len = 4294967296;
 
 const ColorSpace = enum {
     linear,
@@ -165,7 +164,7 @@ const bc7_command: Command = .{
         NamedArg.init(u8, .{
             .description = "quality level, defaults to highest",
             .long = "uber",
-            .default = .{ .value = EncodedImage.Bc7Enc.Params.max_uber_level },
+            .default = .{ .value = Image.Bc7Enc.Params.max_uber_level },
         }),
         NamedArg.init(bool, .{
             .description = "reduce entropy for better supercompression",
@@ -175,7 +174,7 @@ const bc7_command: Command = .{
         NamedArg.init(u8, .{
             .description = "partitions to scan in mode 1, defaults to highest",
             .long = "max-partitions-to-scan",
-            .default = .{ .value = EncodedImage.Bc7Enc.Params.max_partitions },
+            .default = .{ .value = Image.Bc7Enc.Params.max_partitions },
         }),
         NamedArg.init(bool, .{
             .long = "mode-6-only",
@@ -274,44 +273,67 @@ pub fn main() !void {
         output_file.close();
     }
 
-    var texture = try zex.Texture.initFromReader(allocator, input_file.reader(), .{
-        .alpha_is_transparency = switch (args.named.@"input-alpha") {
-            .premultiplied => false,
-            .straight => true,
+    const encoding_options: Image.EncodeOptions = switch (encoding) {
+        .bc7 => |eo| b: {
+            const bc7: Image.Bc7Options = .{
+                .uber_level = eo.named.uber,
+                .reduce_entropy = eo.named.@"reduce-entropy",
+                .max_partitions_to_scan = eo.named.@"max-partitions-to-scan",
+                .mode_6_only = eo.named.@"mode-6-only",
+                .rdo = if (eo.subcommand) |subcommand| switch (subcommand) {
+                    .rdo => |rdo| .{
+                        .lambda = rdo.named.lambda,
+                        .lookback_window = rdo.named.@"lookback-window",
+                        .smooth_block_error_scale = rdo.named.@"smooth-block-error-scale",
+                        .quantize_mode_6_endpoints = rdo.named.@"quantize-mode-6-endpoints",
+                        .weight_modes = rdo.named.@"weight-modes",
+                        .weight_low_frequency_partitions = rdo.named.@"weight-low-frequency-partitions",
+                        .pbit1_weighting = rdo.named.@"pbit1-weighting",
+                        .max_smooth_block_std_dev = rdo.named.@"max-smooth-block-std-dev",
+                        .try_two_matches = rdo.named.@"try-two-matches",
+                        .ultrasmooth_block_handling = rdo.named.@"ultrasmooth-block-handling",
+                    },
+                } else null,
+            };
+            break :b switch (eo.named.@"color-space") {
+                .srgb => .{ .bc7_srgb = bc7 },
+                .linear => .{ .bc7 = bc7 },
+            };
         },
-        .encoding = switch (encoding) {
-            .bc7 => |eo| b: {
-                const bc7: EncodedImage.Options.Bc7 = .{
-                    .uber_level = eo.named.uber,
-                    .reduce_entropy = eo.named.@"reduce-entropy",
-                    .max_partitions_to_scan = eo.named.@"max-partitions-to-scan",
-                    .mode_6_only = eo.named.@"mode-6-only",
-                    .rdo = if (eo.subcommand) |subcommand| switch (subcommand) {
-                        .rdo => |rdo| .{
-                            .lambda = rdo.named.lambda,
-                            .lookback_window = rdo.named.@"lookback-window",
-                            .smooth_block_error_scale = rdo.named.@"smooth-block-error-scale",
-                            .quantize_mode_6_endpoints = rdo.named.@"quantize-mode-6-endpoints",
-                            .weight_modes = rdo.named.@"weight-modes",
-                            .weight_low_frequency_partitions = rdo.named.@"weight-low-frequency-partitions",
-                            .pbit1_weighting = rdo.named.@"pbit1-weighting",
-                            .max_smooth_block_std_dev = rdo.named.@"max-smooth-block-std-dev",
-                            .try_two_matches = rdo.named.@"try-two-matches",
-                            .ultrasmooth_block_handling = rdo.named.@"ultrasmooth-block-handling",
-                        },
-                    } else null,
-                };
-                break :b switch (eo.named.@"color-space") {
-                    .srgb => .{ .bc7_srgb = bc7 },
-                    .linear => .{ .bc7 = bc7 },
-                };
-            },
-            .@"rgba-u8" => |eo| switch (eo.named.@"color-space") {
-                .linear => .rgba_u8,
-                .srgb => .rgba_srgb_u8,
-            },
-            .@"rgba-f32" => .rgba_f32,
+        .@"rgba-u8" => |eo| switch (eo.named.@"color-space") {
+            .linear => .rgba_u8,
+            .srgb => .rgba_srgb_u8,
         },
+        .@"rgba-f32" => .rgba_f32,
+    };
+    const encoding_tag: Image.Encoding = encoding_options;
+
+    var texture: zex.Texture = .{};
+    defer texture.deinit();
+
+    texture.levels.appendAssumeCapacity(try Image.rgbaF32InitFromReader(
+        allocator,
+        max_file_len,
+        input_file.reader(),
+        .{
+            // XXX: a little weird that this arg is here, alos other should be named/have default...
+            .color_space = encoding_tag.colorSpace(),
+            // XXX: support `.other` too in cli
+            .alpha = if (args.named.@"preserve-alpha-coverage") |threshold| .{ .alpha_test = .{
+                .threshold = threshold,
+            } } else .opacity,
+        },
+    ));
+    // XXX: maybe we DO want to set filters/address mode on the texture once up front to make less verbose?
+    // note that we resize the first level via a getter so would need a wrapper for that for that to be doable
+    // with the params
+    // Resize the image if requested
+    try texture.levels.slice()[0].rgbaF32ResizeToFit(.{
+        .max_size = args.named.@"max-size" orelse std.math.maxInt(u32),
+        .max_width = args.named.@"max-width" orelse std.math.maxInt(u32),
+        .max_height = args.named.@"max-height" orelse std.math.maxInt(u32),
+        .address_mode_u = args.named.@"address-mode-u",
+        .address_mode_v = args.named.@"address-mode-v",
         .filter_u = switch (args.named.@"filter-u" orelse args.named.filter orelse @panic("unimplemented")) {
             .triangle => .triangle,
             .@"cubic-b-spline" => .cubic_b_spline,
@@ -326,22 +348,29 @@ pub fn main() !void {
             .mitchell => .mitchell,
             .@"point-sample" => .point_sample,
         },
-        .max_threads = args.named.@"max-threads",
-        .generate_mipmaps = args.named.@"generate-mipmaps",
-        .alpha_test = if (args.named.@"preserve-alpha-coverage") |t| .{
-            .threshold = t,
-            .max_steps = args.named.@"preserve-alpha-coverage-max-steps",
-        } else null,
-        .max_size = args.named.@"max-size" orelse std.math.maxInt(u32),
-        .max_width = args.named.@"max-width" orelse std.math.maxInt(u32),
-        .max_height = args.named.@"max-height" orelse std.math.maxInt(u32),
+    });
+    try texture.rgbaF32GenerateMipmaps(.{
+        .filter_u = switch (args.named.@"filter-u" orelse args.named.filter orelse @panic("unimplemented")) {
+            .triangle => .triangle,
+            .@"cubic-b-spline" => .cubic_b_spline,
+            .@"catmull-rom" => .catmull_rom,
+            .mitchell => .mitchell,
+            .@"point-sample" => .point_sample,
+        },
+        .filter_v = switch (args.named.@"filter-v" orelse args.named.filter orelse @panic("unimplemented")) {
+            .triangle => .triangle,
+            .@"cubic-b-spline" => .cubic_b_spline,
+            .@"catmull-rom" => .catmull_rom,
+            .mitchell => .mitchell,
+            .@"point-sample" => .point_sample,
+        },
         .address_mode_u = args.named.@"address-mode-u",
         .address_mode_v = args.named.@"address-mode-v",
-        .supercompression = if (args.named.zlib) |level| .{
-            .zlib = .{ .level = level.toStdLevel() },
-        } else .none,
+        .block_size = encoding_tag.blockSize(),
     });
-    defer texture.deinit();
-
+    try texture.rgbaF32Encode(allocator, args.named.@"max-threads", encoding_options);
+    if (args.named.zlib) |compression_level| {
+        try texture.compressZlib(allocator, .{ .level = compression_level.toStdLevel() });
+    }
     try texture.writeKtx2(output_file.writer());
 }
