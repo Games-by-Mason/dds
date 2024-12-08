@@ -1,4 +1,5 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const tracy = @import("tracy");
 const Zone = tracy.Zone;
 
@@ -17,14 +18,17 @@ pub const Options = union(enum) {
 };
 
 owned: bool,
+// XXX: does zlib really not store this in the header? I bet it does
+uncompressed_len: u64,
 buf: []const u8,
 
-pub fn init(gpa: std.mem.Allocator, bytes: []const u8, options: Options) Error!@This() {
+pub fn init(gpa: Allocator, bytes: []const u8, options: Options) Error!@This() {
     const zone = Zone.begin(.{ .src = @src() });
     defer zone.end();
     switch (options) {
         .none => return .{
             .owned = false,
+            .uncompressed_len = bytes.len,
             .buf = bytes,
         },
         .zlib => |zlib_options| {
@@ -54,6 +58,7 @@ pub fn init(gpa: std.mem.Allocator, bytes: []const u8, options: Options) Error!@
 
             return .{
                 .owned = true,
+                .uncompressed_len = bytes.len,
                 .buf = b: {
                     const to_owned_zone = Zone.begin(.{ .name = "toOwnedSlice", .src = @src() });
                     defer to_owned_zone.end();
@@ -64,7 +69,7 @@ pub fn init(gpa: std.mem.Allocator, bytes: []const u8, options: Options) Error!@
     }
 }
 
-pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
+pub fn deinit(self: @This(), gpa: Allocator) void {
     const zone = Zone.begin(.{ .src = @src() });
     defer zone.end();
     if (self.owned) gpa.free(self.buf);
