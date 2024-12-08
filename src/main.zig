@@ -259,7 +259,6 @@ pub fn main() !void {
 
     const cwd = std.fs.cwd();
 
-    // Load the first level
     var input_file = cwd.openFile(args.positional.INPUT, .{}) catch |err| {
         log.err("{s}: {s}", .{ args.positional.INPUT, @errorName(err) });
         std.process.exit(1);
@@ -275,7 +274,7 @@ pub fn main() !void {
         output_file.close();
     }
 
-    try zex.createTexture(allocator, input_file.reader(), output_file.writer(), .{
+    var texture = try zex.Texture.initFromReader(allocator, input_file.reader(), .{
         .alpha_is_transparency = switch (args.named.@"input-alpha") {
             .premultiplied => false,
             .straight => true,
@@ -342,4 +341,7 @@ pub fn main() !void {
             .zlib = .{ .level = level.toStdLevel() },
         } else .none,
     });
+    defer texture.deinit();
+
+    try texture.writeKtx2(output_file.writer());
 }

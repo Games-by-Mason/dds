@@ -39,7 +39,7 @@ pub const ColorSpace = enum(c_uint) {
 };
 
 /// Read an image using `stb_image.h`.
-pub fn read(
+pub fn initFromReader(
     gpa: std.mem.Allocator,
     reader: anytype,
     color_space: ColorSpace,
