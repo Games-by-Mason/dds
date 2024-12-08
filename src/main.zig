@@ -274,44 +274,48 @@ pub fn main() !void {
         output_file.close();
     }
 
-    var texture = try zex.Texture.initFromReader(allocator, input_file.reader(), .{
+    const encoding_options: EncodedImage.EncodeOptions = switch (encoding) {
+        .bc7 => |eo| b: {
+            const bc7: EncodedImage.Bc7Options = .{
+                .uber_level = eo.named.uber,
+                .reduce_entropy = eo.named.@"reduce-entropy",
+                .max_partitions_to_scan = eo.named.@"max-partitions-to-scan",
+                .mode_6_only = eo.named.@"mode-6-only",
+                .rdo = if (eo.subcommand) |subcommand| switch (subcommand) {
+                    .rdo => |rdo| .{
+                        .lambda = rdo.named.lambda,
+                        .lookback_window = rdo.named.@"lookback-window",
+                        .smooth_block_error_scale = rdo.named.@"smooth-block-error-scale",
+                        .quantize_mode_6_endpoints = rdo.named.@"quantize-mode-6-endpoints",
+                        .weight_modes = rdo.named.@"weight-modes",
+                        .weight_low_frequency_partitions = rdo.named.@"weight-low-frequency-partitions",
+                        .pbit1_weighting = rdo.named.@"pbit1-weighting",
+                        .max_smooth_block_std_dev = rdo.named.@"max-smooth-block-std-dev",
+                        .try_two_matches = rdo.named.@"try-two-matches",
+                        .ultrasmooth_block_handling = rdo.named.@"ultrasmooth-block-handling",
+                    },
+                } else null,
+            };
+            break :b switch (eo.named.@"color-space") {
+                .srgb => .{ .bc7_srgb = bc7 },
+                .linear => .{ .bc7 = bc7 },
+            };
+        },
+        .@"rgba-u8" => |eo| switch (eo.named.@"color-space") {
+            .linear => .rgba_u8,
+            .srgb => .rgba_srgb_u8,
+        },
+        .@"rgba-f32" => .rgba_f32,
+    };
+    const encoding_tag: EncodedImage.Encoding = encoding_options;
+    var image = try Image.initFromReaderRgbaF32(allocator, input_file.reader(), encoding_tag.colorSpace());
+    // XXX: have it be init from encoded image?
+    var texture = try zex.Texture.initFromImageRgbaF32(&image, .{
         .alpha_is_transparency = switch (args.named.@"input-alpha") {
             .premultiplied => false,
             .straight => true,
         },
-        .encoding = switch (encoding) {
-            .bc7 => |eo| b: {
-                const bc7: EncodedImage.Options.Bc7 = .{
-                    .uber_level = eo.named.uber,
-                    .reduce_entropy = eo.named.@"reduce-entropy",
-                    .max_partitions_to_scan = eo.named.@"max-partitions-to-scan",
-                    .mode_6_only = eo.named.@"mode-6-only",
-                    .rdo = if (eo.subcommand) |subcommand| switch (subcommand) {
-                        .rdo => |rdo| .{
-                            .lambda = rdo.named.lambda,
-                            .lookback_window = rdo.named.@"lookback-window",
-                            .smooth_block_error_scale = rdo.named.@"smooth-block-error-scale",
-                            .quantize_mode_6_endpoints = rdo.named.@"quantize-mode-6-endpoints",
-                            .weight_modes = rdo.named.@"weight-modes",
-                            .weight_low_frequency_partitions = rdo.named.@"weight-low-frequency-partitions",
-                            .pbit1_weighting = rdo.named.@"pbit1-weighting",
-                            .max_smooth_block_std_dev = rdo.named.@"max-smooth-block-std-dev",
-                            .try_two_matches = rdo.named.@"try-two-matches",
-                            .ultrasmooth_block_handling = rdo.named.@"ultrasmooth-block-handling",
-                        },
-                    } else null,
-                };
-                break :b switch (eo.named.@"color-space") {
-                    .srgb => .{ .bc7_srgb = bc7 },
-                    .linear => .{ .bc7 = bc7 },
-                };
-            },
-            .@"rgba-u8" => |eo| switch (eo.named.@"color-space") {
-                .linear => .rgba_u8,
-                .srgb => .rgba_srgb_u8,
-            },
-            .@"rgba-f32" => .rgba_f32,
-        },
+        .encoding = encoding_options,
         .filter_u = switch (args.named.@"filter-u" orelse args.named.filter orelse @panic("unimplemented")) {
             .triangle => .triangle,
             .@"cubic-b-spline" => .cubic_b_spline,
@@ -341,6 +345,29 @@ pub fn main() !void {
             .zlib = .{ .level = level.toStdLevel() },
         } else .none,
     });
+    // try texture.generateMipmaps(.{
+    //     .filter_u = switch (args.named.@"filter-u" orelse args.named.filter orelse @panic("unimplemented")) {
+    //         .triangle => .triangle,
+    //         .@"cubic-b-spline" => .cubic_b_spline,
+    //         .@"catmull-rom" => .catmull_rom,
+    //         .mitchell => .mitchell,
+    //         .@"point-sample" => .point_sample,
+    //     },
+    //     .filter_v = switch (args.named.@"filter-v" orelse args.named.filter orelse @panic("unimplemented")) {
+    //         .triangle => .triangle,
+    //         .@"cubic-b-spline" => .cubic_b_spline,
+    //         .@"catmull-rom" => .catmull_rom,
+    //         .mitchell => .mitchell,
+    //         .@"point-sample" => .point_sample,
+    //     },
+    //     .address_mode_u = args.named.@"address-mode-u",
+    //     .address_mode_v = args.named.@"address-mode-v",
+    //     .block_size = encoding_tag.blockSize(),
+    // });
+    // XXX: ...
+    // try texture.encode(...);
+    // XXX: ...
+    // try texture.compress(...);
     defer texture.deinit();
 
     try texture.writeKtx2(output_file.writer());
