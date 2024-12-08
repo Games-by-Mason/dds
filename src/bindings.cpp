@@ -27,7 +27,9 @@ extern "C" {
 		float * const pixels
 	) {
 		// Encode the image as u8s. We need to do this before initializing the encoder, since doing
-		// so may change the perceptual param that we reference here.
+		// so may change the perceptual param that we reference here. It's unfortunate that the C++
+		// API requires us to do a copy here, but the time it takes to copy an image while not
+		// insignificant is dwarfed by the time it takes to encode as BC7.
 		utils::image_u8 img;
 		img.init(width, height);
 		auto &ldr = img.get_pixels();

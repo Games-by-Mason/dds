@@ -5,19 +5,20 @@ const tracy = @import("tracy");
 const Zone = tracy.Zone;
 const Ktx2 = @import("Ktx2");
 const EncodedImage = @import("EncodedImage.zig");
+const CompressedImage = @import("CompressedImage.zig");
 
 encoding: EncodedImage.Encoding,
 width: u32,
 height: u32,
 alpha_is_transparency: bool,
-uncompressed_level_lengths: []const u64,
-compressed_levels: []const []const u8,
+compressed_levels: std.BoundedArray(CompressedImage, Ktx2.max_levels),
 supercompression: Ktx2.Header.SupercompressionScheme,
 
-pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
-    for (self.compressed_levels) |compressed_level| {
-        gpa.free(compressed_level);
+pub fn deinit(self: *@This()) void {
+    for (self.compressed_levels.slice()) |*compressed_level| {
+        compressed_level.deinit();
     }
+    self.* = undefined;
 }
 
 pub fn writeKtx2(self: @This(), writer: anytype) @TypeOf(writer).Error!void {
@@ -73,9 +74,9 @@ pub fn writeKtx2(self: @This(), writer: anytype) @TypeOf(writer).Error!void {
             var byte_offset: usize = index.dfd_byte_offset + index.dfd_byte_length;
             for (0..self.compressed_levels.len) |i| {
                 byte_offset = std.mem.alignForward(usize, byte_offset, level_alignment);
-                const compressed_level = self.compressed_levels[self.compressed_levels.len - i - 1];
+                const compressed_level = self.compressed_levels.get(self.compressed_levels.len - i - 1);
                 byte_offsets_reverse.appendAssumeCapacity(byte_offset);
-                byte_offset += compressed_level.len;
+                byte_offset += compressed_level.buf.len;
             }
         }
 
@@ -84,8 +85,8 @@ pub fn writeKtx2(self: @This(), writer: anytype) @TypeOf(writer).Error!void {
         for (0..self.compressed_levels.len) |i| {
             try writer.writeStruct(Ktx2.Level{
                 .byte_offset = byte_offsets_reverse.get(self.compressed_levels.len - i - 1),
-                .byte_length = self.compressed_levels[i].len,
-                .uncompressed_byte_length = self.uncompressed_level_lengths[i],
+                .byte_length = self.compressed_levels.get(i).buf.len,
+                .uncompressed_byte_length = self.compressed_levels.get(i).uncompressed_len,
             });
         }
     }
@@ -208,9 +209,9 @@ pub fn writeKtx2(self: @This(), writer: anytype) @TypeOf(writer).Error!void {
             byte_offset = padded;
 
             // Write the level
-            const compressed_level = self.compressed_levels[self.compressed_levels.len - i - 1];
-            try writer.writeAll(compressed_level);
-            byte_offset += compressed_level.len;
+            const compressed_level = self.compressed_levels.get(self.compressed_levels.len - i - 1);
+            try writer.writeAll(compressed_level.buf);
+            byte_offset += compressed_level.buf.len;
         }
     }
 }

@@ -8,6 +8,7 @@
 //! can't trivially use a Zig allocator here since STB's free function isn't given a length.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const log = std.log;
 const c = @import("c.zig");
@@ -22,6 +23,7 @@ width: u32,
 height: u32,
 data: []f32,
 hdr: bool,
+allocator: Allocator,
 
 pub const InitError = error{
     /// STB failed to parse the image.
@@ -109,13 +111,15 @@ pub fn read(
         .height = @intCast(height),
         .data = data_ptr[0..data_len],
         .hdr = hdr,
+        .allocator = stb_allocator,
     };
 }
 
-pub fn deinit(self: Image) void {
+pub fn deinit(self: *Image) void {
     const zone = Zone.begin(.{ .src = @src() });
     defer zone.end();
-    c.stbi_image_free(self.data.ptr);
+    self.allocator.free(self.data);
+    _ = self.toOwned();
 }
 
 pub fn premultiply(self: Image) void {
@@ -128,22 +132,6 @@ pub fn premultiply(self: Image) void {
         self.data[px + 1] = self.data[px + 1] * a;
         self.data[px + 2] = self.data[px + 2] * a;
     }
-}
-
-pub fn copy(self: Image) error{OutOfMemory}!Image {
-    const zone = Zone.begin(.{ .src = @src() });
-    defer zone.end();
-    const data_ptr: [*]f32 = @ptrCast(@alignCast(c.malloc(
-        self.data.len * @sizeOf(f32),
-    ) orelse return error.OutOfMemory));
-    const data = data_ptr[0..self.data.len];
-    @memcpy(data, self.data);
-    return .{
-        .width = self.width,
-        .height = self.height,
-        .data = data,
-        .hdr = self.hdr,
-    };
 }
 
 pub const AddressMode = enum(c_uint) {
@@ -199,8 +187,6 @@ pub fn resized(self: Image, options: ResizeOptions) ResizeError!Image {
     defer zone.end();
     assert(options.width > 0 and options.height > 0);
 
-    if (options.width == self.width and options.height == self.height) return self.copy();
-
     const output_samples = @as(usize, options.width) * @as(usize, options.height) * 4;
     const data_ptr: [*]f32 = @ptrCast(@alignCast(c.malloc(
         output_samples * @sizeOf(f32),
@@ -252,6 +238,7 @@ pub fn resized(self: Image, options: ResizeOptions) ResizeError!Image {
         .height = options.height,
         .data = data,
         .hdr = self.hdr,
+        .allocator = stb_allocator,
     };
 }
 
@@ -445,3 +432,67 @@ pub fn preserveAlphaCoverage(self: Image, options: PreserveAlphaCoverageOptions)
         }
     }
 }
+
+pub fn toOwned(self: *Image) Image {
+    const owned: Image = self.*;
+    self.width = 0;
+    self.height = 0;
+    self.data = &.{};
+    self.allocator = moved_allocator;
+    return owned;
+}
+
+fn unsupportedAlloc(ctx: *anyopaque, len: usize, ptr_align: u8, ret_addr: usize) ?[*]u8 {
+    _ = ctx;
+    _ = len;
+    _ = ptr_align;
+    _ = ret_addr;
+    @panic("unsupported");
+}
+
+fn unsupportedResize(
+    ctx: *anyopaque,
+    buf: []u8,
+    buf_align: u8,
+    new_len: usize,
+    ret_addr: usize,
+) bool {
+    _ = ctx;
+    _ = buf;
+    _ = buf_align;
+    _ = new_len;
+    _ = ret_addr;
+    @panic("unsupported");
+}
+
+fn stbFree(ctx: *anyopaque, buf: []u8, buf_align: u8, ret_addr: usize) void {
+    _ = ctx;
+    _ = buf_align;
+    _ = ret_addr;
+    c.stbi_image_free(buf.ptr);
+}
+
+fn movedFree(ctx: *anyopaque, buf: []u8, buf_align: u8, ret_addr: usize) void {
+    _ = ctx;
+    _ = buf_align;
+    _ = ret_addr;
+    _ = buf;
+}
+
+const stb_allocator: Allocator = .{
+    .ptr = undefined,
+    .vtable = &.{
+        .alloc = &unsupportedAlloc,
+        .resize = &unsupportedResize,
+        .free = &stbFree,
+    },
+};
+
+const moved_allocator: Allocator = .{
+    .ptr = undefined,
+    .vtable = &.{
+        .alloc = &unsupportedAlloc,
+        .resize = &unsupportedResize,
+        .free = &movedFree,
+    },
+};

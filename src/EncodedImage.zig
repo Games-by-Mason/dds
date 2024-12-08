@@ -1,4 +1,6 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
 const log = std.log;
 const tracy = @import("tracy");
 const Zone = tracy.Zone;
@@ -77,18 +79,18 @@ pub const Options = union(Encoding) {
     bc7_srgb: Bc7,
 };
 
-bc7_encoder: ?*Bc7Enc = null,
-owned: bool,
 buf: []u8,
+allocator: Allocator,
 
 pub fn init(
-    gpa: std.mem.Allocator,
-    image: Image,
+    gpa: Allocator,
+    image: *Image,
     max_threads: ?u16,
     options: Options,
 ) Error!@This() {
     const search_zone = Zone.begin(.{ .src = @src() });
     defer search_zone.end();
+    defer image.deinit();
 
     const encoding: Encoding = options;
     switch (options) {
@@ -112,12 +114,16 @@ pub fn init(
             }
             return .{
                 .buf = buf,
-                .owned = true,
+                .allocator = gpa,
             };
         },
-        .rgba_f32 => return .{
-            .buf = std.mem.sliceAsBytes(image.data),
-            .owned = false,
+        .rgba_f32 => {
+            const allocator = image.allocator;
+            const buf = image.toOwned().data;
+            return .{
+                .buf = std.mem.sliceAsBytes(buf),
+                .allocator = allocator,
+            };
         },
         .bc7, .bc7_srgb => |eo| {
             const bc7_zone = Zone.begin(.{ .name = "bc7", .src = @src() });
@@ -218,19 +224,25 @@ pub fn init(
             }
 
             return .{
-                .bc7_encoder = bc7_encoder,
                 .buf = bc7_encoder.getBlocks(),
-                .owned = false,
+                .allocator = bc7EncAllocator(bc7_encoder),
             };
         },
     }
 }
 
-pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
+pub fn deinit(self: *@This()) void {
     const zone = Zone.begin(.{ .src = @src() });
     defer zone.end();
-    if (self.owned) gpa.free(self.buf);
-    if (self.bc7_encoder) |b| b.deinit();
+    self.allocator.free(self.buf);
+    _ = self.toOwned();
+}
+
+pub fn toOwned(self: *@This()) @This() {
+    const owned = self.*;
+    self.buf = &.{};
+    self.allocator = moved_allocator;
+    return owned;
 }
 
 pub const Bc7Enc = opaque {
@@ -326,4 +338,62 @@ pub const Bc7Enc = opaque {
     ) callconv(.C) bool;
     extern fn bc7enc_getBlocks(self: *@This()) callconv(.C) [*]u8;
     extern fn bc7enc_getTotalBlocksSizeInBytes(self: *@This()) callconv(.C) u32;
+};
+
+fn unsupportedAlloc(ctx: *anyopaque, len: usize, ptr_align: u8, ret_addr: usize) ?[*]u8 {
+    _ = ctx;
+    _ = len;
+    _ = ptr_align;
+    _ = ret_addr;
+    @panic("unsupported");
+}
+
+fn unsupportedResize(
+    ctx: *anyopaque,
+    buf: []u8,
+    buf_align: u8,
+    new_len: usize,
+    ret_addr: usize,
+) bool {
+    _ = ctx;
+    _ = buf;
+    _ = buf_align;
+    _ = new_len;
+    _ = ret_addr;
+    @panic("unsupported");
+}
+
+fn bc7EncFree(ctx: *anyopaque, buf: []u8, buf_align: u8, ret_addr: usize) void {
+    _ = buf_align;
+    _ = ret_addr;
+    _ = buf;
+    const bc7_encoder: *Bc7Enc = @ptrCast(ctx);
+    bc7_encoder.deinit();
+}
+
+fn bc7EncAllocator(bc7_encoder: *Bc7Enc) Allocator {
+    return .{
+        .ptr = bc7_encoder,
+        .vtable = &.{
+            .alloc = &unsupportedAlloc,
+            .resize = &unsupportedResize,
+            .free = &bc7EncFree,
+        },
+    };
+}
+
+fn movedFree(ctx: *anyopaque, buf: []u8, buf_align: u8, ret_addr: usize) void {
+    _ = ctx;
+    _ = buf_align;
+    _ = ret_addr;
+    _ = buf;
+}
+
+const moved_allocator: Allocator = .{
+    .ptr = undefined,
+    .vtable = &.{
+        .alloc = &unsupportedAlloc,
+        .resize = &unsupportedResize,
+        .free = &movedFree,
+    },
 };

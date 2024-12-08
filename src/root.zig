@@ -61,12 +61,10 @@ pub fn createTexture(
 
     // Create an array of mip levels.
     var raw_levels: std.BoundedArray(Image, Ktx2.max_levels) = .{};
-    defer for (raw_levels.constSlice()[1..]) |level| {
-        level.deinit();
-    };
+    defer for (raw_levels.slice()) |*level| level.deinit();
 
     // Generate the first level of the mip
-    const alpha_coverage = b: {
+    const alpha_coverage, const width, const height = b: {
         const first_level_zone = Zone.begin(.{ .name = "first level", .src = @src() });
         defer first_level_zone.end();
 
@@ -98,7 +96,7 @@ pub fn createTexture(
         raw_levels.appendAssumeCapacity(image);
 
         // Break with the alpha coverage
-        break :b alpha_coverage;
+        break :b .{ alpha_coverage, image.width, image.height };
     };
 
     // Generate any other requested mipmaps.
@@ -133,15 +131,13 @@ pub fn createTexture(
         }
     }
 
-    // Encode the pixel data
+    // Encode the pixel data, consuming the raw level data in the process
     var encoded_levels: std.BoundedArray(EncodedImage, Ktx2.max_levels) = .{};
-    defer for (encoded_levels.constSlice()) |level| {
-        level.deinit(gpa);
-    };
+    defer for (encoded_levels.slice()) |*level| level.deinit();
     {
         const encode_zone = Zone.begin(.{ .name = "encode", .src = @src() });
         defer encode_zone.end();
-        for (raw_levels.constSlice()) |raw_level| {
+        for (raw_levels.slice()) |*raw_level| {
             encoded_levels.appendAssumeCapacity(try EncodedImage.init(
                 gpa,
                 raw_level,
@@ -149,51 +145,45 @@ pub fn createTexture(
                 options.encoding,
             ));
         }
+        raw_levels.clear();
     }
 
     // Compress the data if needed
     var compressed_levels: std.BoundedArray(CompressedImage, Ktx2.max_levels) = .{};
-    defer for (compressed_levels.constSlice()) |level| {
-        level.deinit(gpa);
-    };
+    defer for (compressed_levels.slice()) |*level| level.deinit();
     {
         const compress_zone = Zone.begin(.{ .name = "compress", .src = @src() });
         defer compress_zone.end();
-        for (encoded_levels.constSlice()) |level_encoder| {
+        for (encoded_levels.slice()) |*encoded_level| {
             compressed_levels.appendAssumeCapacity(try CompressedImage.init(
                 gpa,
-                level_encoder.buf,
+                encoded_level,
                 options.supercompression,
             ));
         }
+        encoded_levels.clear();
     }
 
     // Write the texture as KTX2
     {
         const write_zone = Zone.begin(.{ .name = "write", .src = @src() });
         defer write_zone.end();
-        var uncompressed_level_lengths: std.BoundedArray(u64, Ktx2.max_levels) = .{};
-        for (encoded_levels.constSlice()) |level| {
-            uncompressed_level_lengths.appendAssumeCapacity(level.buf.len);
-        }
-        var compressed_level_bufs: std.BoundedArray([]const u8, Ktx2.max_levels) = .{};
-        for (compressed_levels.constSlice()) |level| {
-            compressed_level_bufs.appendAssumeCapacity(level.buf);
-        }
-        compressed_levels.clear();
-        const texture: Texture = .{
+        var texture: Texture = .{
             .encoding = encoding,
-            .width = raw_levels.get(0).width,
-            .height = raw_levels.get(0).height,
+            .width = width,
+            .height = height,
             .alpha_is_transparency = options.alpha_is_transparency,
-            .uncompressed_level_lengths = uncompressed_level_lengths.constSlice(),
-            .compressed_levels = compressed_level_bufs.constSlice(),
+            .compressed_levels = b: {
+                const moved = compressed_levels;
+                compressed_levels.clear();
+                break :b moved;
+            },
             .supercompression = switch (options.supercompression) {
                 .none => .none,
                 .zlib => .zlib,
             },
         };
-
+        defer texture.deinit();
         try texture.writeKtx2(writer);
     }
 }
